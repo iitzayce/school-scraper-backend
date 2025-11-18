@@ -104,19 +104,27 @@ def run_pipeline_steps(max_schools=5):
         
         # Step 5: Final Compilation
         print("Running Step 5: Final Compilation...")
+        csv_output_path = "step5_final_contacts.csv"
         subprocess.run([
             "python3", "step5.py",
             "--input", "step4_parsed_contacts.csv",
-            "--output", "step5_final_contacts.csv"
+            "--output", csv_output_path
         ], check=True, capture_output=True)
         
-        df5 = pd.read_csv("step5_final_contacts.csv")
+        # Verify CSV was created
+        if not os.path.exists(csv_output_path):
+            raise FileNotFoundError(f"CSV file not created: {csv_output_path}")
+        
+        df5 = pd.read_csv(csv_output_path)
         final_contacts = len(df5)
         summary["totalContacts"] = final_contacts
         summary["steps"].append({
             "name": "Step 5: Final Compilation",
             "finalContacts": final_contacts
         })
+        
+        # Store CSV path for later retrieval
+        summary["_csvPath"] = csv_output_path
         
     except subprocess.CalledProcessError as e:
         summary["status"] = "error"
@@ -152,11 +160,51 @@ def run_pipeline():
         
         # Read the final CSV file and include it in response
         csv_data = None
-        if summary.get("status") == "success" and os.path.exists("step5_final_contacts.csv"):
-            with open("step5_final_contacts.csv", "r", encoding="utf-8") as f:
-                csv_data = f.read()
-            summary["csvData"] = csv_data
-            summary["csvFilename"] = f"school_contacts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        csv_filename = None
+        if summary.get("status") == "success":
+            # Use the path from the pipeline run, or default
+            csv_path = summary.get("_csvPath", "step5_final_contacts.csv")
+            
+            # Try absolute path first, then relative
+            if not os.path.exists(csv_path):
+                # Try in current working directory
+                csv_path = os.path.join(os.getcwd(), "step5_final_contacts.csv")
+            
+            print(f"Attempting to read CSV from: {csv_path}")
+            print(f"Current working directory: {os.getcwd()}")
+            print(f"File exists: {os.path.exists(csv_path)}")
+            
+            if os.path.exists(csv_path):
+                try:
+                    with open(csv_path, "r", encoding="utf-8") as f:
+                        csv_data = f.read()
+                    csv_filename = f"school_contacts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    summary["csvData"] = csv_data
+                    summary["csvFilename"] = csv_filename
+                    print(f"✓ CSV file included in response: {len(csv_data)} bytes, {len(csv_data.splitlines())} lines")
+                except Exception as e:
+                    print(f"✗ Error reading CSV file: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                # List all CSV files in current directory
+                csv_files = [f for f in os.listdir('.') if f.endswith('.csv')]
+                print(f"✗ CSV file not found at: {csv_path}")
+                print(f"Available CSV files: {csv_files}")
+                # Try to find any step5 CSV file
+                for csv_file in csv_files:
+                    if 'step5' in csv_file.lower() or 'final' in csv_file.lower():
+                        print(f"Found potential CSV file: {csv_file}")
+                        try:
+                            with open(csv_file, "r", encoding="utf-8") as f:
+                                csv_data = f.read()
+                            csv_filename = f"school_contacts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                            summary["csvData"] = csv_data
+                            summary["csvFilename"] = csv_filename
+                            print(f"✓ Using alternative CSV file: {csv_file}")
+                            break
+                        except Exception as e:
+                            print(f"Error reading {csv_file}: {e}")
         
         # Add CORS headers to response
         response = jsonify(summary)

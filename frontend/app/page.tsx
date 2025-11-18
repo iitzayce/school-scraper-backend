@@ -70,6 +70,8 @@ export default function Home() {
       }
 
       const data = await response.json();
+      console.log("Pipeline response:", data);
+      console.log("CSV data present:", !!data.csvData);
       setSummary(data);
       setStatus("Pipeline completed successfully!");
     } catch (err) {

@@ -12,6 +12,8 @@ import pandas as pd
 import re
 from typing import List, Dict, Set
 from datetime import datetime
+from pathlib import Path
+import shutil
 
 
 class FinalCompiler:
@@ -274,11 +276,28 @@ class FinalCompiler:
         # Save final CSV
         final_df.to_csv(output_csv, index=False)
         
+        # Copy to user's Downloads folder for easy access
+        self._copy_to_downloads(output_csv)
+        
         # Print summary
         self._print_summary(final_df, output_csv)
         
         # Create quality report
         self._create_quality_report(final_df, output_csv.replace('.csv', '_quality_report.txt'))
+    
+    def _copy_to_downloads(self, file_path: str):
+        """Copy the final CSV to the user's Downloads folder"""
+        try:
+            downloads_dir = Path.home() / "Downloads"
+            if not downloads_dir.exists():
+                print(f"  ⚠️ Downloads folder not found at {downloads_dir}. Skipping copy.")
+                return
+            
+            destination = downloads_dir / Path(file_path).name
+            shutil.copy2(file_path, destination)
+            print(f"  📁 Copied output file to {destination}")
+        except Exception as e:
+            print(f"  ⚠️ Could not copy file to Downloads: {e}")
     
     def _print_summary(self, df: pd.DataFrame, output_file: str):
         """Print final summary statistics"""
