@@ -1,64 +1,133 @@
-import Image from "next/image";
+"use client";
+
+import { useState } from "react";
+
+type StepSummary = {
+  name: string;
+  [key: string]: number | string;
+};
+
+type PipelineSummary = {
+  status: string;
+  steps: StepSummary[];
+  totalContacts: number;
+  runId: string;
+};
 
 export default function Home() {
+  const [status, setStatus] = useState("");
+  const [summary, setSummary] = useState<PipelineSummary | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isRunning, setIsRunning] = useState(false);
+
+  async function runPipeline() {
+    setStatus("Starting pipeline...");
+    setSummary(null);
+    setError(null);
+    setIsRunning(true);
+
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
+      
+      if (!apiUrl) {
+        throw new Error("API URL not configured. Please set NEXT_PUBLIC_API_URL in Vercel environment variables.");
+      }
+
+      const response = await fetch(`${apiUrl}/run-pipeline`, {
+        method: "POST",
+        headers: { 
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ maxSchools: 5 }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Backend responded with ${response.status}: ${errorText || response.statusText}`);
+      }
+
+      const data = await response.json();
+      setSummary(data);
+      setStatus("Pipeline completed successfully!");
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : "Unknown error occurred";
+      setError(errorMessage);
+      setStatus("Pipeline failed");
+      console.error("Pipeline error:", err);
+    } finally {
+      setIsRunning(false);
+    }
+  }
+
   return (
     <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+      <main className="flex min-h-screen w-full max-w-4xl flex-col items-start py-16 px-8 bg-white dark:bg-black">
+        <h1 className="text-4xl font-bold mb-8 text-black dark:text-zinc-50">
+          School Scraper Dashboard
+        </h1>
+
+        <div className="w-full mb-8">
+          <button
+            onClick={runPipeline}
+            disabled={isRunning}
+            className={`px-6 py-3 rounded-lg font-medium text-white transition-colors ${
+              isRunning
+                ? "bg-gray-400 cursor-not-allowed"
+                : "bg-blue-600 hover:bg-blue-700"
+            }`}
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+            {isRunning ? "Running Pipeline..." : "Run Full Pipeline"}
+          </button>
         </div>
+
+        {status && (
+          <div className="w-full mb-4">
+            <p className={`text-lg ${error ? "text-red-600" : "text-gray-700 dark:text-gray-300"}`}>
+              <strong>Status:</strong> {status}
+            </p>
+          </div>
+        )}
+
+        {error && (
+          <div className="w-full mb-4 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+            <p className="text-red-800 dark:text-red-200">
+              <strong>Error:</strong> {error}
+            </p>
+            <p className="text-sm text-red-600 dark:text-red-400 mt-2">
+              Make sure your backend endpoint accepts POST requests at /run-pipeline
+            </p>
+          </div>
+        )}
+
+        {summary && (
+          <section className="w-full mt-6 p-6 bg-gray-50 dark:bg-gray-900 rounded-lg">
+            <h2 className="text-2xl font-semibold mb-4 text-black dark:text-zinc-50">
+              Latest Run Summary
+            </h2>
+            <div className="space-y-2 mb-4">
+              <p className="text-gray-700 dark:text-gray-300">
+                <strong>Run ID:</strong> {summary.runId}
+              </p>
+              <p className="text-gray-700 dark:text-gray-300">
+                <strong>Total Contacts:</strong> {summary.totalContacts}
+              </p>
+            </div>
+            <div className="mt-4">
+              <h3 className="text-xl font-semibold mb-2 text-black dark:text-zinc-50">Steps:</h3>
+              <ul className="list-disc list-inside space-y-1">
+                {summary.steps.map((step, index) => (
+                  <li key={index} className="text-gray-700 dark:text-gray-300">
+                    <strong>{step.name}:</strong>{" "}
+                    {Object.entries(step)
+                      .filter(([key]) => key !== "name")
+                      .map(([key, value]) => `${key}: ${value}`)
+                      .join(", ")}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </section>
+        )}
       </main>
     </div>
   );

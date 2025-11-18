@@ -29,5 +29,5 @@ COPY . .
 ENV PORT=8080
 EXPOSE 8080
 
-# TODO: replace main.py with your actual entry point (Flask/NiceGUI/etc)
-CMD ["python", "main.py"]
+# Run the Flask API server
+CMD ["python", "api.py"]
