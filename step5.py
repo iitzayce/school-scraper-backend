@@ -37,6 +37,14 @@ class FinalCompiler:
             'meet our', 'who we are', 'school information', 'general information'
         ]
         
+        # Common placeholder/fake names to filter out
+        self.placeholder_names = [
+            'john doe', 'jane doe', 'john smith', 'jane smith',
+            'bob jones', 'test user', 'example name', 'sample user',
+            'john test', 'jane test', 'placeholder', 'demo user',
+            'john example', 'jane example', 'test name', 'sample name'
+        ]
+        
         # Non-admin role keywords to exclude
         self.exclude_keywords = [
             'teacher', 'coach', 'instructor', 'aide', 'assistant teacher',
@@ -104,7 +112,7 @@ class FinalCompiler:
     
     def is_valid_name(self, name: str) -> bool:
         """
-        Check if name is valid (not generic page text)
+        Check if name is valid (not generic page text or placeholder names)
         
         Returns:
             True if name appears to be a real person name
@@ -113,6 +121,11 @@ class FinalCompiler:
             return False
         
         name_lower = str(name).strip().lower()
+        
+        # Check for placeholder/fake names (exact match or contains)
+        for placeholder in self.placeholder_names:
+            if placeholder == name_lower or placeholder in name_lower:
+                return False
         
         # Check for generic text patterns
         for pattern in self.generic_name_patterns:
@@ -224,7 +237,10 @@ class FinalCompiler:
         print("\nCleaning and validating...")
         
         # Validate emails
-        df['email_valid'] = df['email'].apply(self.is_valid_email)
+        # Email validation - allow empty emails (for enrichment CSV)
+        # If email is empty, it's valid (we want to keep it for enrichment)
+        # If email is not empty, validate it
+        df['email_valid'] = df['email'].apply(lambda x: True if (pd.isna(x) or str(x).strip() == '') else self.is_valid_email(x))
         df = df[df['email_valid'] == True]
         print(f"  After email validation: {len(df)}")
         
@@ -236,6 +252,15 @@ class FinalCompiler:
         # Skip admin role validation - Step 4 already filters by target titles
         # All contacts from Step 4 already match target titles
         print(f"  Skipping role validation (Step 4 already filtered by target titles)")
+        
+        # Check if dataframe is empty
+        if len(df) == 0:
+            print("  WARNING: No contacts remaining after validation")
+            # Create empty CSV with proper columns
+            empty_df = pd.DataFrame(columns=['School Name', 'First Name', 'Last Name', 'Title', 'Email', 'Phone', 'Confidence Score', 'Source URL'])
+            empty_df.to_csv(output_csv, index=False)
+            self._copy_to_downloads(output_csv)
+            return
         
         # Split names
         df[['first_name', 'last_name']] = df['name'].apply(
@@ -290,14 +315,14 @@ class FinalCompiler:
         try:
             downloads_dir = Path.home() / "Downloads"
             if not downloads_dir.exists():
-                print(f"  ⚠️ Downloads folder not found at {downloads_dir}. Skipping copy.")
+                print(f"  WARNING: Downloads folder not found at {downloads_dir}. Skipping copy.")
                 return
             
             destination = downloads_dir / Path(file_path).name
             shutil.copy2(file_path, destination)
-            print(f"  📁 Copied output file to {destination}")
+            print(f"  Copied output file to {destination}")
         except Exception as e:
-            print(f"  ⚠️ Could not copy file to Downloads: {e}")
+            print(f"  WARNING: Could not copy file to Downloads: {e}")
     
     def _print_summary(self, df: pd.DataFrame, output_file: str):
         """Print final summary statistics"""

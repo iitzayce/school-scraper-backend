@@ -16,7 +16,7 @@ app = Flask(__name__)
 # Enable CORS - allow all origins for now (restrict in production)
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type"]}})
 
-def run_pipeline_steps(max_schools=5):
+def run_pipeline_steps(max_schools=100):
     """
     Run all 5 pipeline steps and return summary
     """
@@ -24,34 +24,33 @@ def run_pipeline_steps(max_schools=5):
         "status": "success",
         "steps": [],
         "totalContacts": 0,
+        "totalContactsNoEmails": 0,
+        "schoolsFound": 0,
         "runId": datetime.now().isoformat()
     }
     
     try:
-        # Step 1: School Discovery
+        # Step 1: School Discovery - Search multiple random counties to get target schools
         print("Running Step 1: School Discovery...")
         subprocess.run([
             "python3", "step1.py",
             "--api-key", os.getenv("GOOGLE_PLACES_API_KEY", ""),
             "--state", "Texas",
-            "--max-counties", "1",
-            "--max-search-terms", "2",
-            "--max-api-calls", "10",
+            "--multiple-random-counties", str(max_schools),
+            "--max-search-terms", "5",  # More search terms per county for better coverage
+            "--max-api-calls", "200",  # Increased API call limit for 100 schools
             "--output", "step1_schools.csv"
         ], check=True, capture_output=True)
         
         # Read Step 1 results
         df1 = pd.read_csv("step1_schools.csv")
         schools_found = len(df1)
+        
+        summary["schoolsFound"] = schools_found
         summary["steps"].append({
             "name": "Step 1: School Discovery",
             "schoolsFound": schools_found
         })
-        
-        # Limit to max_schools for testing
-        if len(df1) > max_schools:
-            df1.head(max_schools).to_csv("step1_schools.csv", index=False)
-            schools_found = max_schools
         
         # Step 2: Page Discovery
         print("Running Step 2: Page Discovery...")
@@ -59,8 +58,8 @@ def run_pipeline_steps(max_schools=5):
             "python3", "step2.py",
             "--input", "step1_schools.csv",
             "--output", "step2_pages.csv",
-            "--max-pages-per-school", "30",
-            "--top-pages-limit", "5"
+            "--max-pages-per-school", "50",  # Increased for better coverage
+            "--top-pages-limit", "5"  # Keep top 5 pages per school
         ], check=True, capture_output=True)
         
         df2 = pd.read_csv("step2_pages.csv")
@@ -90,41 +89,70 @@ def run_pipeline_steps(max_schools=5):
         subprocess.run([
             "python3", "step4.py",
             "--input", "step3_content.csv",
-            "--output", "step4_parsed_contacts.csv",
+            "--output", "step4_contacts_with_emails.csv",
+            "--output-no-emails", "step4_contacts_no_emails.csv",
             "--api-key", os.getenv("OPENAI_API_KEY", ""),
-            "--model", "gpt-3.5-turbo"
+            "--model", "gpt-4o-mini"
         ], check=True, capture_output=True)
         
-        df4 = pd.read_csv("step4_parsed_contacts.csv")
-        contacts_extracted = len(df4)
+        # Read both CSV files from Step 4
+        contacts_with_emails = 0
+        contacts_without_emails = 0
+        if os.path.exists("step4_contacts_with_emails.csv"):
+            df4_with = pd.read_csv("step4_contacts_with_emails.csv")
+            contacts_with_emails = len(df4_with)
+        if os.path.exists("step4_contacts_no_emails.csv"):
+            df4_without = pd.read_csv("step4_contacts_no_emails.csv")
+            contacts_without_emails = len(df4_without)
+        
         summary["steps"].append({
             "name": "Step 4: LLM Parsing",
-            "contactsExtracted": contacts_extracted
+            "contactsWithEmails": contacts_with_emails,
+            "contactsWithoutEmails": contacts_without_emails
         })
         
-        # Step 5: Final Compilation
+        # Step 5: Final Compilation (process contacts WITH emails)
         print("Running Step 5: Final Compilation...")
         csv_output_path = "step5_final_contacts.csv"
-        subprocess.run([
-            "python3", "step5.py",
-            "--input", "step4_parsed_contacts.csv",
-            "--output", csv_output_path
-        ], check=True, capture_output=True)
+        csv_no_emails_path = "step5_final_contacts_no_emails.csv"
         
-        # Verify CSV was created
-        if not os.path.exists(csv_output_path):
-            raise FileNotFoundError(f"CSV file not created: {csv_output_path}")
+        # Process contacts with emails
+        if os.path.exists("step4_contacts_with_emails.csv"):
+            subprocess.run([
+                "python3", "step5.py",
+                "--input", "step4_contacts_with_emails.csv",
+                "--output", csv_output_path
+            ], check=True, capture_output=True)
         
-        df5 = pd.read_csv(csv_output_path)
-        final_contacts = len(df5)
-        summary["totalContacts"] = final_contacts
+        # Process contacts without emails (for enrichment)
+        if os.path.exists("step4_contacts_no_emails.csv"):
+            subprocess.run([
+                "python3", "step5.py",
+                "--input", "step4_contacts_no_emails.csv",
+                "--output", csv_no_emails_path
+            ], check=True, capture_output=True)
+        
+        # Read final results
+        final_contacts_with_emails = 0
+        final_contacts_without_emails = 0
+        if os.path.exists(csv_output_path):
+            df5 = pd.read_csv(csv_output_path)
+            final_contacts_with_emails = len(df5)
+        if os.path.exists(csv_no_emails_path):
+            df5_no_emails = pd.read_csv(csv_no_emails_path)
+            final_contacts_without_emails = len(df5_no_emails)
+        
+        summary["totalContacts"] = final_contacts_with_emails
+        summary["totalContactsNoEmails"] = final_contacts_without_emails
         summary["steps"].append({
             "name": "Step 5: Final Compilation",
-            "finalContacts": final_contacts
+            "finalContactsWithEmails": final_contacts_with_emails,
+            "finalContactsWithoutEmails": final_contacts_without_emails
         })
         
-        # Store CSV path for later retrieval
+        # Store CSV paths for later retrieval
         summary["_csvPath"] = csv_output_path
+        summary["_csvNoEmailsPath"] = csv_no_emails_path
         
     except subprocess.CalledProcessError as e:
         summary["status"] = "error"
@@ -153,58 +181,44 @@ def run_pipeline():
     
     try:
         data = request.get_json() or {}
-        max_schools = data.get("maxSchools", 5)
+        max_schools = data.get("maxSchools", 100)  # Default to 100 schools
         
         # Run pipeline (this will take 2-5 minutes)
         summary = run_pipeline_steps(max_schools=max_schools)
         
-        # Read the final CSV file and include it in response
-        csv_data = None
-        csv_filename = None
+        # Read the final CSV files and include them in response
         if summary.get("status") == "success":
-            # Use the path from the pipeline run, or default
+            # Read contacts WITH emails
             csv_path = summary.get("_csvPath", "step5_final_contacts.csv")
-            
-            # Try absolute path first, then relative
             if not os.path.exists(csv_path):
-                # Try in current working directory
                 csv_path = os.path.join(os.getcwd(), "step5_final_contacts.csv")
-            
-            print(f"Attempting to read CSV from: {csv_path}")
-            print(f"Current working directory: {os.getcwd()}")
-            print(f"File exists: {os.path.exists(csv_path)}")
             
             if os.path.exists(csv_path):
                 try:
                     with open(csv_path, "r", encoding="utf-8") as f:
                         csv_data = f.read()
-                    csv_filename = f"school_contacts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    csv_filename = f"school_contacts_with_emails_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
                     summary["csvData"] = csv_data
                     summary["csvFilename"] = csv_filename
-                    print(f"✓ CSV file included in response: {len(csv_data)} bytes, {len(csv_data.splitlines())} lines")
+                    print(f"CSV file (with emails) included: {len(csv_data)} bytes")
                 except Exception as e:
-                    print(f"✗ Error reading CSV file: {e}")
-                    import traceback
-                    traceback.print_exc()
-            else:
-                # List all CSV files in current directory
-                csv_files = [f for f in os.listdir('.') if f.endswith('.csv')]
-                print(f"✗ CSV file not found at: {csv_path}")
-                print(f"Available CSV files: {csv_files}")
-                # Try to find any step5 CSV file
-                for csv_file in csv_files:
-                    if 'step5' in csv_file.lower() or 'final' in csv_file.lower():
-                        print(f"Found potential CSV file: {csv_file}")
-                        try:
-                            with open(csv_file, "r", encoding="utf-8") as f:
-                                csv_data = f.read()
-                            csv_filename = f"school_contacts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-                            summary["csvData"] = csv_data
-                            summary["csvFilename"] = csv_filename
-                            print(f"✓ Using alternative CSV file: {csv_file}")
-                            break
-                        except Exception as e:
-                            print(f"Error reading {csv_file}: {e}")
+                    print(f"ERROR: Error reading CSV file: {e}")
+            
+            # Read contacts WITHOUT emails
+            csv_no_emails_path = summary.get("_csvNoEmailsPath", "step5_final_contacts_no_emails.csv")
+            if not os.path.exists(csv_no_emails_path):
+                csv_no_emails_path = os.path.join(os.getcwd(), "step5_final_contacts_no_emails.csv")
+            
+            if os.path.exists(csv_no_emails_path):
+                try:
+                    with open(csv_no_emails_path, "r", encoding="utf-8") as f:
+                        csv_no_emails_data = f.read()
+                    csv_no_emails_filename = f"school_contacts_no_emails_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    summary["csvNoEmailsData"] = csv_no_emails_data
+                    summary["csvNoEmailsFilename"] = csv_no_emails_filename
+                    print(f"CSV file (no emails) included: {len(csv_no_emails_data)} bytes")
+                except Exception as e:
+                    print(f"ERROR: Error reading CSV file (no emails): {e}")
         
         # Add CORS headers to response
         response = jsonify(summary)

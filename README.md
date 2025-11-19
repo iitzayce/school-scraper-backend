@@ -148,7 +148,7 @@ python3 step5.py \
 - Deduplication
 - Confidence scoring
 
-## 📊 Output Files
+## Output Files
 
 - `step1_schools.csv` - Discovered schools with websites
 - `step2_pages.csv` - Discovered pages per school (prioritized)
@@ -186,7 +186,7 @@ The pipeline filters for these decision-maker roles:
 - **100 schools**: ~$0.46 (LLM) + ~$1.70 (Places API) = **~$2.16**
 - **1000 schools**: ~$4.60 (LLM) + ~$17.00 (Places API) = **~$21.60**
 
-## ☁️ Deployment
+## Deployment
 
 ### Google Cloud Setup
 

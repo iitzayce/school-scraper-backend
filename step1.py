@@ -13,6 +13,7 @@ import time
 from datetime import datetime
 from typing import List, Dict
 import argparse
+import random
 
 class SchoolSearcher:
     def __init__(self, api_key: str):
@@ -124,6 +125,118 @@ class SchoolSearcher:
 
         return schools, county_new_schools
 
+    def search_random_county_sample(
+        self,
+        counties: List[str],
+        state: str,
+        output_file: str,
+        sample_size: int = 10,
+        max_search_terms: int = None,
+        max_api_calls: int = None
+    ):
+        """Pick a random county, search it, and return a random sample of schools"""
+        print("\n" + "="*70)
+        print(f"RANDOM COUNTY SAMPLE MODE - {state.upper()}")
+        print("="*70)
+        print(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Pick a random county
+        selected_county = random.choice(counties)
+        print(f"Selected random county: {selected_county} County")
+        print(f"Target sample size: {sample_size} schools")
+        print("="*70 + "\n")
+        
+        start_time = time.time()
+        
+        # Search the selected county
+        print(f"Searching {selected_county} County...")
+        county_schools, new_count = self.search_county(
+            selected_county,
+            state,
+            max_search_terms=max_search_terms,
+            max_api_calls=max_api_calls
+        )
+        
+        self.all_schools.extend(county_schools)
+        self.stats['counties_searched'] = 1
+        self.stats['total_schools_found'] = len(self.all_schools)
+        
+        print(f"\nFound {len(self.all_schools)} total schools in {selected_county} County")
+        
+        # Randomly sample the requested number
+        if len(self.all_schools) > sample_size:
+            print(f"Randomly sampling {sample_size} schools from {len(self.all_schools)} found...")
+            self.all_schools = random.sample(self.all_schools, sample_size)
+            self.stats['total_schools_found'] = len(self.all_schools)
+        elif len(self.all_schools) < sample_size:
+            print(f"Warning: Only found {len(self.all_schools)} schools (requested {sample_size})")
+        
+        self._save_to_csv(output_file)
+        self._print_summary(time.time() - start_time, output_file)
+
+    def search_multiple_random_counties(
+        self,
+        counties: List[str],
+        state: str,
+        output_file: str,
+        target_schools: int = 100,
+        max_search_terms: int = None,
+        max_api_calls: int = None
+    ):
+        """Search multiple random counties until we reach target number of schools"""
+        print("\n" + "="*70)
+        print(f"MULTIPLE RANDOM COUNTIES MODE - {state.upper()}")
+        print("="*70)
+        print(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Target: {target_schools} schools")
+        print("="*70 + "\n")
+        
+        start_time = time.time()
+        counties_searched = []
+        max_counties_to_search = min(20, len(counties))  # Search up to 20 counties max
+        
+        # Shuffle counties for randomness
+        shuffled_counties = counties.copy()
+        random.shuffle(shuffled_counties)
+        
+        for county in shuffled_counties[:max_counties_to_search]:
+            if len(self.all_schools) >= target_schools:
+                break
+                
+            if max_api_calls is not None and self.stats['total_api_calls'] >= max_api_calls:
+                print(f"\nAPI call limit reached. Stopping county searches.")
+                break
+            
+            print(f"Searching {county} County...")
+            county_schools, new_count = self.search_county(
+                county,
+                state,
+                max_search_terms=max_search_terms,
+                max_api_calls=max_api_calls
+            )
+            
+            self.all_schools.extend(county_schools)
+            counties_searched.append(county)
+            self.stats['counties_searched'] = len(counties_searched)
+            self.stats['total_schools_found'] = len(self.all_schools)
+            
+            print(f"    Found {new_count} new schools | Total: {self.stats['total_schools_found']}")
+            
+            if len(self.all_schools) >= target_schools:
+                print(f"\nReached target of {target_schools} schools!")
+                break
+        
+        # Randomly sample to exactly target_schools if we have more
+        if len(self.all_schools) > target_schools:
+            print(f"\nRandomly sampling {target_schools} schools from {len(self.all_schools)} found...")
+            self.all_schools = random.sample(self.all_schools, target_schools)
+            self.stats['total_schools_found'] = len(self.all_schools)
+        elif len(self.all_schools) < target_schools:
+            print(f"\nWarning: Only found {len(self.all_schools)} schools (requested {target_schools})")
+        
+        self._save_to_csv(output_file)
+        self._print_summary(time.time() - start_time, output_file)
+
     def search_all_counties(
         self,
         counties: List[str],
@@ -131,7 +244,8 @@ class SchoolSearcher:
         output_file: str,
         max_counties: int = None,
         max_search_terms: int = None,
-        max_api_calls: int = None
+        max_api_calls: int = None,
+        max_schools: int = None
     ):
         """Search all counties and save results"""
         print("\n" + "="*70)
@@ -147,6 +261,8 @@ class SchoolSearcher:
             print(f"Search terms per county limited to: {max_search_terms}")
         if max_api_calls is not None:
             print(f"Total API call limit: {max_api_calls}")
+        if max_schools is not None:
+            print(f"Maximum schools to collect: {max_schools}")
 
         print("="*70 + "\n")
 
@@ -169,6 +285,14 @@ class SchoolSearcher:
             self.stats['total_schools_found'] = len(self.seen_place_ids)
 
             print(f"    Found {new_count} new schools | Total: {self.stats['total_schools_found']}")
+
+            # Check if we've reached max_schools limit
+            if max_schools is not None and len(self.all_schools) >= max_schools:
+                print(f"\nReached maximum schools limit ({max_schools}). Stopping search.")
+                # Trim to exactly max_schools
+                self.all_schools = self.all_schools[:max_schools]
+                self.stats['total_schools_found'] = len(self.all_schools)
+                break
 
             # Progress update every 20 counties
             if i % 20 == 0:
@@ -231,26 +355,51 @@ if __name__ == "__main__":
     parser.add_argument('--max-counties', type=int, help='Maximum number of counties to search')
     parser.add_argument('--max-search-terms', type=int, help='Maximum search queries per county')
     parser.add_argument('--max-api-calls', type=int, help='Maximum total Google Places API calls for this run')
+    parser.add_argument('--max-schools', type=int, help='Maximum number of schools to collect (stops early when reached)')
+    parser.add_argument('--random-county-sample', type=int, metavar='N', help='Pick a random county and return N random schools (testing mode)')
+    parser.add_argument('--multiple-random-counties', type=int, metavar='N', help='Search multiple random counties until N schools are found')
     
     args = parser.parse_args()
     
     # Select county list based on state
     counties = TEXAS_COUNTIES if args.state.lower() == 'texas' else IOWA_COUNTIES
     
-    print(f"\nStarting Christian School Discovery for {args.state}...")
-    time.sleep(2)
-    
     searcher = SchoolSearcher(api_key=args.api_key)
     
     try:
-        searcher.search_all_counties(
-            counties,
-            args.state,
-            args.output,
-            max_counties=args.max_counties,
-            max_search_terms=args.max_search_terms,
-            max_api_calls=args.max_api_calls
-        )
+        # If multiple-random-counties is specified, use that mode
+        if args.multiple_random_counties is not None:
+            searcher.search_multiple_random_counties(
+                counties,
+                args.state,
+                args.output,
+                target_schools=args.multiple_random_counties,
+                max_search_terms=args.max_search_terms,
+                max_api_calls=args.max_api_calls
+            )
+        # If random-county-sample is specified, use that mode
+        elif args.random_county_sample is not None:
+            searcher.search_random_county_sample(
+                counties,
+                args.state,
+                args.output,
+                sample_size=args.random_county_sample,
+                max_search_terms=args.max_search_terms,
+                max_api_calls=args.max_api_calls
+            )
+        else:
+            # Otherwise use the normal search mode
+            print(f"\nStarting Christian School Discovery for {args.state}...")
+            time.sleep(2)
+            searcher.search_all_counties(
+                counties,
+                args.state,
+                args.output,
+                max_counties=args.max_counties,
+                max_search_terms=args.max_search_terms,
+                max_api_calls=args.max_api_calls,
+                max_schools=args.max_schools
+            )
     except KeyboardInterrupt:
         searcher._save_to_csv(args.output)
         print(f"\nInterrupted. Saved partial results to: {args.output}")

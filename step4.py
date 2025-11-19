@@ -1,19 +1,22 @@
 """
-STEP 4: PARSE HTML WITH LLM
-============================
-Take ALL raw HTML from Step 3 and use GPT to extract contacts,
-then filter for target titles using fuzzy matching.
+STEP 4: PARSE HTML WITH LLM (WITH INTELLIGENT ROLE FILTERING)
+================================================================
+Take ALL raw HTML from Step 3 and use GPT to extract and filter contacts.
 
-Extracts ALL contacts, then filters for:
-- Principal variants (Principal, Head of School, Superintendent, etc.)
-- IT roles (IT Director, CTO, Technology Director, etc.)
-- Facilities roles (Facilities Director, Facilities Manager, etc.)
-- Security roles (Security Director, Security Manager, etc.)
+INTELLIGENT FILTERING via LLM:
+- LLM extracts all contacts from the page
+- LLM intelligently matches titles to target roles (handles misspellings, variations)
+- LLM excludes non-target roles (coaches, teachers, etc.)
+- Returns only decision-makers: Principals, Directors, IT, Facilities, Security, Operations, Finance
 
-Uses fuzzy matching to catch slight variations (e.g., "Superintendent" vs "Superintendant")
+Validation:
+- Name exists and is not empty
+- Title exists and is not empty
+- Email exists and is not empty
+- Role filtering handled by LLM prompt (intelligent matching)
 
 Input: CSV from Step 3 with ALL raw HTML content
-Output: CSV with filtered contacts matching target titles (name, title, email, phone)
+Output: CSV with filtered contacts matching target roles (name, title, email, phone)
 """
 
 from openai import OpenAI
@@ -27,7 +30,7 @@ from difflib import SequenceMatcher
 
 
 class LLMParser:
-    def __init__(self, api_key: str, model: str = "gpt-3.5-turbo"):
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
         """
         Initialize LLM parser
         
@@ -74,6 +77,8 @@ class LLMParser:
             # Athletics (not relevant to security grants)
             'athletic director', 'athletics director', 'athletics',
             'coach', 'athletic coach', 'sports director',
+            # Admissions (not a decision-maker for security grants)
+            'director of admissions', 'admissions director', 'admissions coordinator',
             # Academic roles (curriculum-focused, not operations)
             'academic dean', 'lower school dean', 'upper school dean', 
             'dean of students', 'dean of academics',
@@ -89,10 +94,11 @@ class LLMParser:
             'teacher', 'instructor', 'guidance counselor', 'counselor'
         ]
     
-    def extract_text_from_html(self, html: str, max_length: int = 8000) -> str:
+    def extract_text_from_html(self, html: str, max_length: int = None) -> str:
         """
         Extract clean text from HTML, removing scripts/styles
-        Limit to max_length characters to avoid token limits
+        NO TRUNCATION - GPT-4o-mini supports 128k tokens (~500k chars)
+        Extract full content to ensure nothing is missed
         """
         if not html:
             return ""
@@ -103,80 +109,191 @@ class LLMParser:
         for element in soup(['script', 'style', 'meta', 'link', 'noscript', 'header', 'footer', 'nav']):
             element.decompose()
         
-        # Get text
-        text = soup.get_text(separator='\n', strip=True)
+        # Get all text
+        all_text = soup.get_text(separator='\n', strip=True)
         
         # Clean up excessive whitespace
-        text = re.sub(r'\n\s*\n', '\n\n', text)
-        text = re.sub(r' +', ' ', text)
+        all_text = re.sub(r'\n\s*\n', '\n\n', all_text)
+        all_text = re.sub(r' +', ' ', all_text)
         
-        # Truncate if too long
-        if len(text) > max_length:
-            text = text[:max_length] + "..."
-        
-        return text
+        # NO TRUNCATION - return full text
+        # GPT-4o-mini supports 128k tokens, which is ~500k characters
+        # Most pages are well under this limit
+        return all_text
     
     def create_parsing_prompt(self, html_text: str, school_name: str) -> str:
         """
-        Create prompt for LLM to extract contact information
+        Create prompt for LLM to extract and intelligently filter contact information
         
-        IMPROVED PROMPT to fix title mismatch and generic text issues:
-        - Emphasize matching names with their CORRECT titles
-        - Extract actual person names, not generic page text
-        - Be more explicit about structure matching
+        The LLM will:
+        1. Extract ALL contacts from the page
+        2. Intelligently match titles to target roles (handling variations, misspellings)
+        3. Exclude non-target roles
+        4. Return only filtered contacts
         """
-        prompt = f"""You are an expert at extracting contact information from school websites.
+        
+        # Build target roles list for prompt
+        target_roles_text = """
+TARGET ROLES (Include these - decision-makers for security grants):
+- Principals: Principal, Head of School, Superintendent, Superintendant (both spellings), 
+  Assistant Principal, Vice Principal, Acting Principal, Interim Principal, 
+  Lower/Middle/High School Principal, Headmaster, Executive Principal
+- Directors: Director of Operations, Director of Finance, Director of IT/Technology, 
+  Director of Facilities, Director of Security, Director of Business, 
+  School Director, Director of Schools
+- Managers: Facilities Manager, Security Manager, Operations Manager, Business Manager
+- Executives: CFO (Chief Financial Officer), COO (Chief Operating Officer), 
+  CTO (Chief Technology Officer), Chief Academic Officer
+- IT/Technology: IT Director, Technology Director, Director of Technology, 
+  IT Manager, IT Assistant (include assistants in IT roles)
+- Facilities: Facilities Director, Facilities Manager, Director of Facilities, 
+  Maintenance Supervisor (if oversees facilities)
+- Security: Security Director, Security Manager, Director of Security, 
+  Chief Security Officer
+- Operations/Finance: Operations Director, Finance Director, Business Manager, 
+  Director of Finance and Operations
 
-Extract ALL contacts (people with names, titles, and emails) from the following text from {school_name}'s website.
+Use INTELLIGENT MATCHING:
+- Handle misspellings: "Superintendant" = "Superintendent"
+- Handle variations: "Head of School" = "Principal", "IT Director" = "Technology Director"
+- Handle synonyms: "Facilities Manager" = "Building Manager" (if context suggests facilities)
+- Include assistants in IT/Facilities roles: "IT Assistant" (include), "Facilities Assistant" (include)
+- Match partial titles: "Director" with "IT" or "Facilities" or "Security" in context
+"""
+        
+        exclude_roles_text = """
+EXCLUSION ROLES (Exclude these - not decision-makers for security grants):
+- Athletics: Athletic Director, Athletics Director, Coach, Head Coach, Sports Director, 
+  Varsity Coach, Assistant Coach, Athletic Coordinator
+- Academic: Academic Dean, Dean of Students, Dean of Academics, Curriculum Director, 
+  Academic Director, Director of Curriculum
+- Admissions: Director of Admissions, Admissions Director, Admissions Coordinator
+  (These are NOT decision-makers for security grants)
+- Teachers: Teacher, Instructor (unless also has admin title like "Principal")
+- Support Staff: Counselor, Guidance Counselor, Librarian, Library Director, 
+  Registrar, Receptionist, Aide, Assistant (unless IT/Facilities)
+- Arts/Activities: Music Director, Arts Director, Fine Arts Director, 
+  Activities Director, Student Activities Director, Student Life Director
+- Other: Morning Care, Extended Care (unless Director level)
 
-CRITICAL INSTRUCTIONS - READ CAREFULLY:
-1. Extract EVERY contact you find - do NOT filter by role (include all: teachers, staff, admin, coaches, etc.)
-2. Match each person's name with their ACTUAL title/role that appears IMMEDIATELY NEXT TO or NEAR their name
-3. DO NOT assign generic titles like "principal" to people who are not principals - only use the EXACT title that appears with that person's name
-4. DO NOT extract generic page text as names. Common mistakes to avoid:
+EXCLUSION RULES:
+- If title is ONLY "Teacher", "Coach", "Counselor" → EXCLUDE
+- If title contains "Athletic" or "Athletics" → EXCLUDE
+- If title contains "Admissions" → EXCLUDE (e.g., "Director of Admissions", "Admissions Director")
+- If title is "Assistant" without IT/Facilities context → EXCLUDE
+- If title is generic like "Admissions", "Connect", "Administration" (not a person) → EXCLUDE
+"""
+        
+        prompt = f"""You are an expert at extracting and filtering contact information from school websites.
+
+Extract contact information from the following text from {school_name}'s website.
+
+CRITICAL RULE: ZERO GUESSING - ONLY EXTRACT WHAT YOU CAN ACTUALLY SEE
+
+ABSOLUTE PROHIBITIONS (DO NOT VIOLATE THESE):
+- DO NOT guess, infer, assume, or create ANY data
+- DO NOT match names to titles unless they appear TOGETHER on the page
+- DO NOT match names to emails unless they appear TOGETHER on the page
+- DO NOT create emails based on name patterns (e.g., "John Smith" → "jsmith@school.edu")
+- DO NOT assign titles to names if they are not clearly associated on the page
+- DO NOT use placeholder names: "John Doe", "Jane Smith", "Test User", etc.
+- DO NOT extract generic page text as names: "About", "Admissions", "Contact Us"
+- DO NOT infer relationships - if name and title are on different parts of the page, DO NOT match them
+- DO NOT fill in missing data - if email is missing, DO NOT include the contact
+- DO NOT use "best guess" or "likely" - ONLY use what is EXPLICITLY visible
+
+STEP 1: EXTRACTION (STRICT RULES)
+1. Extract contacts where you can see name and title together (email is OPTIONAL - see below)
+2. If an email is visible, it MUST appear on the same line or immediately near the person's name
+3. DO NOT create, infer, guess, or assume email addresses - ONLY extract emails that are EXPLICITLY displayed
+4. If no email is visible near a person's name, still extract the contact but leave email as empty string ""
+5. DO NOT use placeholder names like "John Doe", "John Smith", "Jane Doe", "Bob Jones", "Test User", or any generic names
+6. Match each person's name with their ACTUAL title/role that appears IMMEDIATELY NEXT TO or ON THE SAME LINE as their name
+7. Name and title MUST appear together - if they are separated, DO NOT match them
+8. DO NOT extract generic page text as names. Common mistakes to avoid:
    - Navigation links: "About", "Admissions", "Contact Us", "Home", "Staff Directory"
    - Page headings: "About Us", "School Information", "General Information"
    - Section labels: "Faculty", "Administration", "Our Team"
+   - Generic departments: "Admissions", "Athletics", "Administration" (unless it's clearly a person's name)
    - These are NOT person names - they are page elements
-5. Only extract actual person names - look for patterns like:
-   - "John Smith, Principal" (name followed by comma and title)
-   - "Principal: Jane Doe" (title followed by colon and name)
-   - "Jane Doe - Director of Finance" (name followed by dash and title)
-   - Email addresses paired with a name (e.g., "jsmith@school.edu" near "John Smith")
-6. Person names are typically 2-4 words (first name, middle name/initial, last name)
-   - Examples: "John Smith", "Mary Jane Doe", "Dr. Robert Jones"
-   - NOT: "About", "Admissions", "Contact Us", "Staff Information"
-7. Include ALL roles: teachers, coaches, counselors, administrators, staff, principals, directors, etc.
-8. Each contact MUST have: name (actual person name), title (their EXACT role from the page), email
-9. If phone is not found, use empty string ""
-10. Ensure email addresses are valid format
-11. Return ONLY valid JSON array format - no markdown, no explanation
+9. Person names are typically 2-4 words (first name, middle name/initial, last name)
+   - Real examples: "Mary Johnson", "Robert T. Williams", "Dr. Sarah Martinez"
+   - NOT: "John Doe", "Jane Smith", "About", "Admissions", "Contact Us"
+10. Extract contacts if you can see name and title together - email is OPTIONAL (can be empty string "")
 
-MATCHING RULES (critical for accuracy):
-- Look for names and titles that appear TOGETHER on the same line or nearby
-- If you see "John Smith, Principal" → name: "John Smith", title: "Principal"
-- If you see "Principal: Jane Doe" → name: "Jane Doe", title: "Principal"
-- If you see "Bob Jones - Basketball Coach" → name: "Bob Jones", title: "Basketball Coach"
-- DO NOT assign a title to a name if they are not clearly associated
+STEP 2: INTELLIGENT ROLE FILTERING
+{target_roles_text}
+
+{exclude_roles_text}
+
+FILTERING INSTRUCTIONS:
+- Extract contacts from the page where name and title are visible together (email is OPTIONAL)
+- For each contact, determine if their title matches TARGET ROLES using intelligent matching
+- Handle misspellings, variations, and synonyms intelligently (e.g., "Superintendant" = "Superintendent")
+- If title matches EXCLUSION ROLES, exclude that contact
+- If title is ambiguous, use context clues (e.g., "Assistant" in IT department = include)
+- Return contacts that:
+  1. Have name and title visible together on the page (email is OPTIONAL - can be empty string "")
+  2. Match TARGET ROLES (using intelligent matching)
+  3. Do NOT match EXCLUSION ROLES
+
+STEP 3: OUTPUT FORMAT
+Each contact MUST have:
+- name: Actual person name visible on the page (NOT placeholder names or generic text)
+- title: Their EXACT role from the page (as it appears, must be visible near the name)
+- email: Email address if VISIBLY SHOWN on the page (NOT inferred or created, must be visible near the name), otherwise empty string ""
+- phone: Phone number if visible, otherwise empty string ""
+
+CRITICAL: Name and title MUST be visible together - email is OPTIONAL (can be empty string "").
+CRITICAL: DO NOT guess which email belongs to which person - only match if they appear together.
+CRITICAL: DO NOT guess which title belongs to which person - only match if they appear together.
+CRITICAL: Extract contacts matching TARGET ROLES even if they don't have visible emails - leave email as "".
+Return ONLY valid JSON array format - no markdown, no explanation.
+
+MATCHING RULES (critical for accuracy - STRICT ENFORCEMENT):
+- Name and title MUST appear on the SAME LINE or immediately adjacent lines
+- If an email is visible, it MUST appear on the SAME LINE or immediately adjacent lines to the name
+- If name and title are visible together, extract the contact (email is OPTIONAL - can be empty string "")
+- DO NOT create emails based on name patterns (e.g., don't create "jdoe@" from "John Doe")
+- DO NOT assign a title to a name if they are not clearly associated on the same line/area
 - DO NOT mix up names and titles from different people on the page
+- DO NOT assume relationships - only use what is explicitly visible
+- If you see a name and title together but no email visible, STILL extract the contact with email as ""
+- If you see an email but no name visible near it, DO NOT include that contact
+- If you see a name but no title visible near it, DO NOT include that contact
 
-COMMON MISTAKES TO AVOID:
-- Extracting page navigation as names: "About", "Contact", "Staff Directory" ❌
-- Extracting section headings as names: "Our Team", "Faculty", "Administration" ❌
-- Assigning wrong titles: If page shows "Director of Finance: John Smith", don't assign "Principal" ❌
-- Extracting generic phrases: "about sl and admissions", "general information", etc. ❌
+EXAMPLES OF INTELLIGENT MATCHING:
+- "Head of School" -> MATCHES (Principal variant)
+- "Superintendant" -> MATCHES (Superintendent, misspelling handled)
+- "IT Assistant" -> MATCHES (IT role, assistant is OK)
+- "Director of Information Technology" -> MATCHES (IT Director variant)
+- "Facilities Manager" -> MATCHES (Target role)
+- "Athletic Director" -> EXCLUDE (Exclusion role)
+- "Varsity Head Coach" -> EXCLUDE (Coach, exclusion role)
+- "High School Math Teacher" -> EXCLUDE (Teacher, not admin)
+- "IT Director" -> MATCHES (Target role)
+- "Principal" -> MATCHES (Target role)
 
-Example output format:
+Example output format (use REAL names and emails from the page, not these examples):
 [
-  {{"name": "John Smith", "title": "Principal", "email": "jsmith@school.edu", "phone": "555-123-4567"}},
-  {{"name": "Jane Doe", "title": "Teacher", "email": "jdoe@school.edu", "phone": ""}},
-  {{"name": "Bob Jones", "title": "Basketball Coach", "email": "bjones@school.edu", "phone": "555-987-6543"}}
+  {{"name": "Actual Name From Page", "title": "Principal", "email": "real.email@school.edu", "phone": "555-123-4567"}},
+  {{"name": "Another Real Name", "title": "IT Director", "email": "another.real@school.edu", "phone": ""}}
 ]
 
 Website text:
 {html_text}
 
-Return ONLY the JSON array:"""
+FINAL CHECKLIST - Before including any contact, verify:
+1. Name is visible on the page (not generic text, not placeholder)
+2. Title is visible on the page (near the name, on same line or adjacent)
+3. Email is OPTIONAL - if visible, it must be near the name (on same line or adjacent), otherwise use empty string ""
+4. Name and title appear together in the same area (email is OPTIONAL)
+5. Title matches TARGET ROLES (using intelligent matching)
+6. Title does NOT match EXCLUSION ROLES
+7. You did NOT guess, infer, or create any of the data
+
+Return ONLY the JSON array with contacts that meet the above criteria.
+Extract contacts matching TARGET ROLES even if they don't have visible emails - use empty string "" for email."""
         
         return prompt
     
@@ -192,10 +309,19 @@ Return ONLY the JSON array:"""
                 prompt = self.create_parsing_prompt(html_text, school_name)
                 
                 # Use new OpenAI client API
-                # Estimate tokens needed: ~50 tokens per contact, allow up to 4000 tokens for large pages
-                # Detect if this is a large page (many emails) and increase max_tokens
+                # GPT-4o-mini supports 128k tokens for output - use generous limits
+                # Estimate tokens: ~4 characters per token
+                estimated_input_tokens = len(html_text) // 4
                 estimated_contacts = html_text.count('@')  # Rough estimate
-                max_tokens = 4000 if estimated_contacts > 20 else 2000
+                
+                # Set max_tokens very high to ensure nothing is truncated
+                # Allow up to 32k tokens for response (well within 128k limit)
+                if estimated_contacts > 50 or estimated_input_tokens > 10000:
+                    max_tokens = 32000  # Very large pages - maximum response size
+                elif estimated_contacts > 20 or estimated_input_tokens > 5000:
+                    max_tokens = 16000  # Large pages
+                else:
+                    max_tokens = 8000  # Normal pages - still generous
                 
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -203,7 +329,7 @@ Return ONLY the JSON array:"""
                         {"role": "system", "content": "You are a data extraction assistant. Return only valid JSON. Match names to their correct titles."},
                         {"role": "user", "content": prompt}
                     ],
-                    temperature=0.1,
+                    temperature=0.0,  # Zero temperature for maximum accuracy, no creativity
                     max_tokens=max_tokens
                 )
                 
@@ -220,56 +346,84 @@ Return ONLY the JSON array:"""
                 
                 # Validate structure
                 if not isinstance(contacts, list):
-                    print(f"      ⚠️  Response not a list: {type(contacts)}")
+                    print(f"      WARNING: Response not a list: {type(contacts)}")
                     return []
                 
-                # Validate and filter contacts by target titles (fuzzy matching)
+                # Validate contacts (only email/name validation, NO title filtering)
                 valid_contacts = []
-                filtered_count = 0
+                invalid_count = 0
                 for contact in contacts:
                     if self._is_valid_contact(contact):
                         valid_contacts.append(contact)
                     else:
-                        filtered_count += 1
+                        invalid_count += 1
                 
-                if filtered_count > 0:
-                    print(f"      (Filtered {filtered_count} contacts - didn't match target titles)")
+                if invalid_count > 0:
+                    print(f"      (Removed {invalid_count} contacts - missing name, title, or email)")
                 
                 return valid_contacts
                 
             except json.JSONDecodeError as e:
                 if attempt < max_retries - 1:
-                    print(f"      ⚠️  JSON parse error (attempt {attempt + 1}/{max_retries}), retrying...")
+                    print(f"      WARNING: JSON parse error (attempt {attempt + 1}/{max_retries}), retrying...")
                     time.sleep(2)
                     continue
-                print(f"      ❌ JSON parse error: {e}")
+                print(f"      ERROR: JSON parse error: {e}")
                 print(f"      Response length: {len(response_text)} chars")
                 print(f"      Response preview: {response_text[:300]}")
                 
-                # Try to recover partial JSON (find complete objects before the error)
+                # Try to recover partial JSON (improved recovery)
                 try:
-                    # Find the last complete JSON object before the error
-                    # Look for closing braces and brackets
+                    # Strategy 1: Find last complete array closing bracket
                     last_complete = response_text.rfind(']')
                     if last_complete > 0:
-                        # Try to parse up to the last complete bracket
                         partial_json = response_text[:last_complete + 1]
-                        contacts = json.loads(partial_json)
-                        if isinstance(contacts, list) and len(contacts) > 0:
-                            print(f"      ⚠️  Recovered {len(contacts)} contacts from partial JSON")
-                            # Validate and filter
-                            valid_contacts = [c for c in contacts if self._is_valid_contact(c)]
-                            return valid_contacts
-                except:
+                        # Try to find and close any incomplete objects
+                        open_braces = partial_json.count('{')
+                        close_braces = partial_json.count('}')
+                        if open_braces > close_braces:
+                            # Add missing closing braces
+                            partial_json += '}' * (open_braces - close_braces)
+                        try:
+                            contacts = json.loads(partial_json)
+                            if isinstance(contacts, list) and len(contacts) > 0:
+                                print(f"      WARNING: Recovered {len(contacts)} contacts from partial JSON")
+                                # Validate (only email/name, NO title filtering)
+                                valid_contacts = [c for c in contacts if self._is_valid_contact(c)]
+                                if valid_contacts:
+                                    return valid_contacts
+                        except:
+                            pass
+                    
+                    # Strategy 2: Extract individual complete JSON objects
+                    # Find all complete { ... } objects
+                    object_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+                    matches = re.findall(object_pattern, response_text)
+                    if matches:
+                        recovered_contacts = []
+                        for match in matches:
+                            try:
+                                obj = json.loads(match)
+                                if isinstance(obj, dict) and 'name' in obj and 'email' in obj:
+                                    recovered_contacts.append(obj)
+                            except:
+                                continue
+                        if recovered_contacts:
+                            print(f"      WARNING: Recovered {len(recovered_contacts)} contacts from individual objects")
+                            # Validate (only email/name, NO title filtering)
+                            valid_contacts = [c for c in recovered_contacts if self._is_valid_contact(c)]
+                            if valid_contacts:
+                                return valid_contacts
+                except Exception as recovery_error:
                     pass  # Recovery failed, return empty
                 
                 return []
             except Exception as e:
                 if attempt < max_retries - 1:
-                    print(f"      ⚠️  LLM error (attempt {attempt + 1}/{max_retries}): {e}, retrying...")
+                    print(f"      WARNING: LLM error (attempt {attempt + 1}/{max_retries}): {e}, retrying...")
                     time.sleep(2 ** attempt)  # Exponential backoff
                     continue
-                print(f"      ❌ LLM error: {e}")
+                print(f"      ERROR: LLM error: {e}")
                 return []
         
         return []  # All retries failed
@@ -318,8 +472,15 @@ Return ONLY the JSON array:"""
         
         # Strategy 1: Exact substring match (fastest)
         # Check if any target title is contained in the title or vice versa
+        # Handle comma-separated titles (e.g., "Head of School, Principal")
+        title_parts = [part.strip() for part in title_lower.split(',')]
         for target in self.target_titles:
             target_lower = target.lower()
+            # Check if target matches any part of the title (handles comma-separated)
+            for part in title_parts:
+                if target_lower in part or part in target_lower:
+                    return True
+            # Also check full title match
             if target_lower in title_lower or title_lower in target_lower:
                 return True
         
@@ -378,37 +539,33 @@ Return ONLY the JSON array:"""
     
     def _is_valid_contact(self, contact: Dict) -> bool:
         """
-        Validate contact and filter by target titles using fuzzy matching
+        Validate contact - check that name and title exist (email is optional)
+        NO email format validation - let GPT prompt handle what's valid
+        NO title filtering - extract all contacts the LLM finds
         """
-        required_fields = ['name', 'title', 'email']
-        
+        required_fields = ['name', 'title']
+
         # Check required fields exist
         if not all(field in contact for field in required_fields):
             return False
-        
-        # Check name and title are non-empty
-        if not contact['name'] or not contact['title']:
+
+        # Check name and title are non-empty (email is optional)
+        if not contact.get('name') or not contact.get('title'):
             return False
-        
-        # Check email format (basic validation)
-        email = contact.get('email', '')
-        email_pattern = r'^[a-zA-Z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}$'
-        if not re.match(email_pattern, email):
-            return False
-        
-        # Filter by target titles using fuzzy matching
-        if not self._matches_target_title(contact['title']):
-            return False
-        
+
+        # Email is optional - can be empty string "" for contacts without visible emails
+        # NO EMAIL FORMAT VALIDATION - GPT prompt handles what's valid
+        # NO TITLE FILTERING - accept all contacts with name and title
         return True
     
-    def parse_pages(self, input_csv: str, output_csv: str):
+    def parse_pages(self, input_csv: str, output_csv: str, output_no_emails_csv: str = None):
         """
         Parse all pages from Step 3 using LLM
         
         Args:
             input_csv: CSV from Step 3 with HTML content
-            output_csv: Output CSV with parsed contacts
+            output_csv: Output CSV with parsed contacts that HAVE emails
+            output_no_emails_csv: Output CSV with parsed contacts WITHOUT emails (for enrichment)
         """
         print("\n" + "="*70)
         print("STEP 4: PARSING HTML WITH LLM")
@@ -442,7 +599,7 @@ Return ONLY the JSON array:"""
             html_text = self.extract_text_from_html(html_content)
             
             if not html_text:
-                print(f"    ⚠️  No text extracted")
+                print(f"    WARNING: No text extracted")
                 continue
             
             print(f"    Extracted {len(html_text)} chars of text")
@@ -456,7 +613,7 @@ Return ONLY the JSON array:"""
             if contacts:
                 pages_with_contacts += 1
                 total_contacts += len(contacts)
-                print(f"    ✓ Found {len(contacts)} contacts")
+                print(f"    Found {len(contacts)} contacts")
                 
                 # Add school and URL to each contact
                 for contact in contacts:
@@ -466,19 +623,43 @@ Return ONLY the JSON array:"""
             else:
                 print(f"    - No valid contacts found")
             
-            # Save progress every 10 pages
+            # Save progress every 10 pages (temporary - will split at end)
             if pages_processed % 10 == 0:
-                self._save_results(all_contacts, output_csv)
-                print(f"\n  💾 Progress saved: {total_contacts} contacts from {pages_processed} pages")
+                # Temporarily save all contacts together
+                temp_contacts_with = [c for c in all_contacts if c.get('email', '').strip()]
+                temp_contacts_without = [c for c in all_contacts if not c.get('email', '').strip()]
+                if temp_contacts_with:
+                    self._save_results(temp_contacts_with, output_csv)
+                if output_no_emails_csv and temp_contacts_without:
+                    self._save_results(temp_contacts_without, output_no_emails_csv)
+                print(f"\n  Progress saved: {total_contacts} contacts from {pages_processed} pages")
             
-            # Rate limiting to avoid API throttling
-            time.sleep(1)
+            # Minimal rate limiting - GPT-4o-mini has high rate limits
+            # Only small delay to avoid overwhelming the API
+            time.sleep(0.5)
         
-        # Final save
-        self._save_results(all_contacts, output_csv)
+        # Split contacts into two groups: with emails and without emails
+        contacts_with_emails = []
+        contacts_without_emails = []
+        
+        for contact in all_contacts:
+            email = contact.get('email', '').strip()
+            if email and email != '':
+                contacts_with_emails.append(contact)
+            else:
+                contacts_without_emails.append(contact)
+        
+        # Save contacts with emails
+        if contacts_with_emails:
+            self._save_results(contacts_with_emails, output_csv)
+        
+        # Save contacts without emails (for enrichment)
+        if output_no_emails_csv and contacts_without_emails:
+            self._save_results(contacts_without_emails, output_no_emails_csv)
         
         # Print summary
-        self._print_summary(all_contacts, output_csv, pages_processed, pages_with_contacts)
+        self._print_summary(all_contacts, output_csv, pages_processed, pages_with_contacts, 
+                          contacts_with_emails, contacts_without_emails, output_no_emails_csv)
     
     def _save_results(self, contacts: List[Dict], filename: str):
         """Save parsed contacts to CSV"""
@@ -494,10 +675,12 @@ Return ONLY the JSON array:"""
         df.to_csv(filename, index=False)
     
     def _print_summary(self, contacts: List[Dict], output_file: str, 
-                       pages_processed: int, pages_with_contacts: int):
+                       pages_processed: int, pages_with_contacts: int,
+                       contacts_with_emails: List[Dict], contacts_without_emails: List[Dict],
+                       output_no_emails_csv: str = None):
         """Print parsing summary"""
         if not contacts:
-            print("\n❌ No contacts extracted")
+            print("\nERROR: No contacts extracted")
             return
         
         df = pd.DataFrame(contacts)
@@ -508,10 +691,14 @@ Return ONLY the JSON array:"""
         print(f"Pages processed: {pages_processed}")
         print(f"Pages with contacts: {pages_with_contacts} ({pages_with_contacts/pages_processed*100:.1f}%)")
         print(f"Total contacts extracted: {len(df)}")
+        print(f"  - Contacts WITH emails: {len(contacts_with_emails)}")
+        print(f"  - Contacts WITHOUT emails: {len(contacts_without_emails)}")
         print(f"Unique schools: {df['school_name'].nunique()}")
         print(f"\nAverage contacts per page: {len(df)/pages_processed:.2f}")
         print(f"Contacts with phone numbers: {df['phone'].ne('').sum()} ({df['phone'].ne('').sum()/len(df)*100:.1f}%)")
-        print(f"\nOutput file: {output_file}")
+        print(f"\nOutput file (with emails): {output_file}")
+        if output_no_emails_csv:
+            print(f"Output file (without emails, for enrichment): {output_no_emails_csv}")
         print("="*70)
         
         # Show top schools
@@ -532,10 +719,11 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Parse HTML with LLM to extract contacts')
     parser.add_argument('--input', required=True, help='Input CSV from Step 3')
-    parser.add_argument('--output', default='parsed_contacts.csv', help='Output CSV filename')
+    parser.add_argument('--output', default='step4_contacts_with_emails.csv', help='Output CSV filename for contacts WITH emails')
+    parser.add_argument('--output-no-emails', default='step4_contacts_no_emails.csv', help='Output CSV filename for contacts WITHOUT emails (for enrichment)')
     parser.add_argument('--api-key', required=True, help='OpenAI API key')
-    parser.add_argument('--model', default='gpt-3.5-turbo', help='Model to use (default: gpt-3.5-turbo)')
+    parser.add_argument('--model', default='gpt-4o-mini', help='Model to use (default: gpt-4o-mini)')
     args = parser.parse_args()
     
     parser = LLMParser(api_key=args.api_key, model=args.model)
-    parser.parse_pages(args.input, args.output)
+    parser.parse_pages(args.input, args.output, args.output_no_emails)

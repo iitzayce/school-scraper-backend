@@ -254,7 +254,7 @@ class ContentCollector:
                 # Quick check: if no emails found in simple HTML, try Selenium
                 emails = self.extract_emails(html)
                 if not emails or len(emails) == 0:
-                    print(f"    ⚠️  No emails in HTML, trying Selenium (click/hover reveals)...")
+                    print(f"    WARNING: No emails in HTML, trying Selenium (click/hover reveals)...")
                     
                     # TIER 2: Fallback to Selenium
                     if self.use_selenium:
@@ -266,13 +266,13 @@ class ContentCollector:
                             # Re-check emails after Selenium
                             emails = self.extract_emails(html)
                             if emails:
-                                print(f"    ✓ Found {len(emails)} emails via Selenium")
+                                print(f"    Found {len(emails)} emails via Selenium")
                 else:
-                    print(f"    ✓ Found {len(emails)} emails via simple HTML")
+                    print(f"    Found {len(emails)} emails via simple HTML")
             else:
                 # If requests failed, try Selenium directly
                 if self.use_selenium:
-                    print(f"    ⚠️  Requests failed, trying Selenium...")
+                    print(f"    WARNING: Requests failed, trying Selenium...")
                     html_selenium = self.fetch_with_selenium(url, interact=True)
                     if html_selenium:
                         html = html_selenium
@@ -280,7 +280,7 @@ class ContentCollector:
             
             # If we still have no HTML at this point, page fetch failed
             if not html:
-                print(f"    ❌ Failed to fetch page content")
+                print(f"    ERROR: Failed to fetch page content")
                 return None
             
             # Count emails found
@@ -345,14 +345,14 @@ class ContentCollector:
             
             if content:
                 all_content.append(content)
-                print(f"  ✓ Collected content ({content['fetch_method']}) - {content['email_count']} emails found")
+                print(f"  Collected content ({content['fetch_method']}) - {content['email_count']} emails found")
             else:
-                print(f"  ❌ Failed to collect content")
+                print(f"  ERROR: Failed to collect content")
             
             # Save progress every 10 pages
             if (idx + 1) % 10 == 0:
                 self._save_content(all_content, output_csv)
-                print(f"\n  💾 Progress saved: {len(all_content)} pages collected so far")
+                print(f"\n  Progress saved: {len(all_content)} pages collected so far")
             
             time.sleep(0.5)  # Polite delay
         
@@ -383,7 +383,7 @@ class ContentCollector:
     def _print_summary_content(self, content_list: List[Dict], output_file: str, pages_df):
         """Print final summary"""
         if not content_list:
-            print("\n❌ No content collected")
+            print("\nERROR: No content collected")
             return
         
         df = pd.DataFrame(content_list)

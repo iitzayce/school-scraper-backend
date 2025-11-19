@@ -26,11 +26,28 @@ class PageDiscoverer:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
         
-        # Keywords to prioritize pages likely to have contact info
-        self.priority_keywords = [
-            'staff', 'faculty', 'administration', 'admin', 'contact', 'about',
-            'leadership', 'team', 'directory', 'personnel', 'our-team',
-            'meet-our', 'who-we-are', 'board', 'principal', 'superintendent'
+        # Configurable thresholds
+        self.min_priority_threshold = 40  # only keep pages at/above this score if possible
+        
+        # Keywords to prioritize pages likely to have decision-maker info
+        self.high_value_keywords = [
+            'staff', 'faculty', 'directory', 'administration', 'admin', 'team',
+            'leadership', 'our-team', 'who-we-are', 'meet-our', 'personnel',
+            'board', 'principal', 'superintendent'
+        ]
+        self.support_value_keywords = ['about', 'mission', 'vision', 'history']
+        self.low_value_keywords = ['contact', 'info', 'location']
+        
+        # Keywords / domains that usually indicate low-value pages
+        self.bad_url_keywords = [
+            'calendar', 'athletic', 'sports', 'admission', 'apply', 'enroll',
+            'event', 'news', 'blog', 'lunch', 'menu', 'forms', 'download',
+            'linktr.ee', 'facebook.com', 'instagram.com', 'twitter.com',
+            'youtube.com', 'vimeo.com', 'docs.google.com', 'drive.google.com'
+        ]
+        self.bad_domains = [
+            'linktr.ee', 'facebook.com', 'instagram.com', 'twitter.com',
+            'youtube.com', 'vimeo.com', 'docs.google.com', 'drive.google.com'
         ]
         
     def safe_get(self, url: str) -> requests.Response:
@@ -106,27 +123,68 @@ class PageDiscoverer:
     def score_page_priority(self, url: str) -> int:
         """Score URL based on likelihood of containing contact info"""
         url_lower = url.lower()
+        parsed = urlparse(url_lower)
+        netloc = parsed.netloc
         score = 0
         
-        for keyword in self.priority_keywords:
+        for keyword in self.high_value_keywords:
+            if keyword in url_lower:
+                score += 25
+        for keyword in self.support_value_keywords:
             if keyword in url_lower:
                 score += 10
+        for keyword in self.low_value_keywords:
+            if keyword in url_lower:
+                score += 5
         
-        # Boost for specific high-value pages
-        if 'contact' in url_lower or 'staff' in url_lower:
-            score += 20
+        # Penalize low-value keywords / hosts
+        for keyword in self.bad_url_keywords:
+            if keyword in url_lower:
+                score -= 25
+        if any(bad_domain in netloc for bad_domain in self.bad_domains):
+            score -= 40
         
         # EXTRA BOOST for hash fragments indicating team/staff pages
-        # e.g., /about/#about-team should score very high
         if '#' in url_lower:
-            hash_part = url_lower.split('#')[1] if '#' in url_lower else ''
-            hash_keywords = ['team', 'staff', 'faculty', 'leadership', 'directory', 'contact']
+            hash_part = url_lower.split('#')[1]
+            hash_keywords = ['team', 'staff', 'faculty', 'leadership', 'directory', 'admin']
             if any(keyword in hash_part for keyword in hash_keywords):
-                score += 30  # Big boost for team/staff hash fragments
+                score += 20
         
         return score
 
-    def discover_pages(self, school_name: str, base_url: str, max_depth: int = 2, max_pages_per_school: int = 30, top_pages_limit: int = 5) -> List[Dict]:
+    def score_page_content(self, soup: BeautifulSoup) -> int:
+        """Boost score based on page content (names, emails, headings)"""
+        content_score = 0
+        text = soup.get_text(separator=' ', strip=True)
+        
+        # Count emails on page
+        mailto_links = soup.select('a[href^="mailto:"]')
+        mailto_count = len(mailto_links)
+        if mailto_count >= 5:
+            content_score += 40
+        elif mailto_count >= 2:
+            content_score += 25
+        elif mailto_count == 1:
+            content_score += 10
+        
+        # Names pattern detection (simple heuristic)
+        name_matches = re.findall(r'[A-Z][a-z]+\\s[A-Z][a-z]+', text)
+        if len(name_matches) >= 10:
+            content_score += 30
+        elif len(name_matches) >= 5:
+            content_score += 15
+        
+        # Heading keywords
+        heading_text = ' '.join([h.get_text(separator=' ', strip=True).lower() for h in soup.find_all(['h1', 'h2', 'h3'])])
+        for keyword in self.high_value_keywords:
+            if keyword in heading_text:
+                content_score += 10
+                break
+        
+        return content_score
+
+    def discover_pages(self, school_name: str, base_url: str, max_depth: int = 2, max_pages_per_school: int = 30, top_pages_limit: int = 3) -> List[Dict]:
         """
         Discover all pages on a school website
         
@@ -143,7 +201,7 @@ class PageDiscoverer:
         print(f"  Base URL: {base_url}")
         
         if not base_url or base_url == '':
-            print("    ⚠️  No website URL provided")
+            print("    WARNING: No website URL provided")
             return []
         
         visited = set()
@@ -152,7 +210,7 @@ class PageDiscoverer:
         to_visit = []
         heapq.heappush(to_visit, (0, 0, base_url))  # Start with homepage (priority 0)
         discovered_pages = []
-        high_priority_found = 0  # Count pages with score >= 30
+        high_priority_found = 0  # Count pages with score >= 40
         
         while to_visit and len(discovered_pages) < max_pages_per_school:
             # Pop highest priority page
@@ -168,7 +226,7 @@ class PageDiscoverer:
                 break
             
             # Skip low-priority pages if we already have enough high-priority ones
-            if high_priority_found >= 10 and priority_estimate < 20:
+            if high_priority_found >= top_pages_limit and priority_estimate < 40:
                 continue
             
             visited.add(current_url)
@@ -185,6 +243,7 @@ class PageDiscoverer:
                 
                 # Calculate priority score
                 priority = self.score_page_priority(current_url)
+                priority += self.score_page_content(soup)
                 
                 # Track high-priority pages
                 if priority >= 30:
@@ -226,10 +285,15 @@ class PageDiscoverer:
         # Sort by priority score (highest first)
         discovered_pages.sort(key=lambda x: x['priority_score'], reverse=True)
         
-        # Final filter: Only keep top N pages per school (by priority)
-        discovered_pages = discovered_pages[:top_pages_limit]
+        # Final filter: prefer only pages at/above the priority threshold
+        high_confidence = [page for page in discovered_pages if page['priority_score'] >= self.min_priority_threshold]
+        if high_confidence:
+            discovered_pages = high_confidence[:top_pages_limit]
+        else:
+            # Fallback: keep at most one best page when nothing meets the threshold
+            discovered_pages = discovered_pages[:min(top_pages_limit, len(discovered_pages), 1)]
         
-        print(f"    ✓ Discovered {len(discovered_pages)} pages (kept top {top_pages_limit} by priority)")
+        print(f"    Discovered {len(discovered_pages)} high-priority pages (threshold: {self.min_priority_threshold})")
         if discovered_pages:
             print(f"    Top priority pages:")
             for page in discovered_pages:
@@ -273,13 +337,13 @@ class PageDiscoverer:
                 all_pages.extend(pages)
                 
             except Exception as e:
-                print(f"    ❌ Error: {e}")
+                print(f"    ERROR: {e}")
                 continue
             
             # Save progress every 10 schools
             if (idx + 1) % 10 == 0:
                 self._save_progress(all_pages, output_csv)
-                print(f"\n  💾 Progress saved: {len(all_pages)} pages discovered")
+                print(f"\n  Progress saved: {len(all_pages)} pages discovered")
         
         # Final save
         self._save_progress(all_pages, output_csv)
@@ -308,7 +372,7 @@ if __name__ == "__main__":
     parser.add_argument('--output', default='step2_pages.csv', help='Output CSV filename')
     parser.add_argument('--max-depth', type=int, default=2, help='Maximum crawl depth (default: 2)')
     parser.add_argument('--max-pages-per-school', type=int, default=30, help='Maximum pages to discover per school (default: 30)')
-    parser.add_argument('--top-pages-limit', type=int, default=5, help='Final filter: keep only top N pages per school by priority (default: 5)')
+    parser.add_argument('--top-pages-limit', type=int, default=3, help='Final filter: keep only top N pages per school by priority (default: 3)')
     
     args = parser.parse_args()
     
