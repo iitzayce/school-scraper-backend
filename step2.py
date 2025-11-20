@@ -38,7 +38,12 @@ class PageDiscoverer:
         self.support_value_keywords = ['about', 'mission', 'vision', 'history']
         self.low_value_keywords = ['contact', 'info', 'location']
         
-        # Keywords / domains that usually indicate low-value pages
+        # Keywords / domains that usually indicate low-value pages (ZERO priority)
+        self.zero_priority_keywords = [
+            'contact', 'contact-us', 'contactus', 'contact_us',  # Contact pages = 0 priority
+            'admission', 'admissions', 'apply', 'enrollment', 'enroll'  # Admissions = 0 priority
+        ]
+        
         self.bad_url_keywords = [
             'calendar', 'athletic', 'sports', 'admission', 'apply', 'enroll',
             'event', 'news', 'blog', 'lunch', 'menu', 'forms', 'download',
@@ -127,6 +132,11 @@ class PageDiscoverer:
         netloc = parsed.netloc
         score = 0
         
+        # ZERO PRIORITY: Contact and admissions pages (emails never there)
+        for keyword in self.zero_priority_keywords:
+            if keyword in url_lower:
+                return 0  # Immediately return 0 - these pages are worthless
+        
         for keyword in self.high_value_keywords:
             if keyword in url_lower:
                 score += 25
@@ -184,7 +194,7 @@ class PageDiscoverer:
         
         return content_score
 
-    def discover_pages(self, school_name: str, base_url: str, max_depth: int = 3, max_pages_per_school: int = 1000, top_pages_limit: int = 1000) -> List[Dict]:
+    def discover_pages(self, school_name: str, base_url: str, max_depth: int = 3, max_pages_per_school: int = 3, top_pages_limit: int = 3) -> List[Dict]:
         """
         Discover all pages on a school website
         
@@ -212,6 +222,10 @@ class PageDiscoverer:
         discovered_pages = []
         high_priority_found = 0  # Count pages with score >= 40
         
+        # Track staff pages found (stop after 3)
+        staff_pages_found = 0
+        staff_keywords_in_url = ['staff', 'faculty', 'directory', 'administration', 'admin', 'team', 'leadership', 'personnel']
+        
         while to_visit and len(discovered_pages) < max_pages_per_school:
             # Pop highest priority page
             neg_priority, depth, current_url = heapq.heappop(to_visit)
@@ -221,13 +235,16 @@ class PageDiscoverer:
             if current_url in visited or depth > max_depth:
                 continue
             
-            # Early stopping: if we found enough high-priority pages, stop crawling low-priority ones
+            # Stop after finding 3 staff pages (user requirement: max 3 staff pages per site)
+            if staff_pages_found >= 3:
+                break
+            
+            # Early stopping: if we found enough high-priority pages, stop crawling
             if len(discovered_pages) >= max_pages_per_school:
                 break
             
-            # Skip low-priority pages only if we have MANY high-priority ones (increased threshold)
-            # Changed from 40 to 20 to be less aggressive - still get medium-priority staff pages
-            if high_priority_found >= top_pages_limit and priority_estimate < 20:
+            # Skip zero-priority pages (contact, admissions) - already filtered in score_page_priority
+            if priority_estimate <= 0:
                 continue
             
             visited.add(current_url)
@@ -250,6 +267,11 @@ class PageDiscoverer:
                 if priority >= 30:
                     high_priority_found += 1
                 
+                # Check if this is a staff page (increment counter)
+                url_lower = current_url.lower()
+                if any(keyword in url_lower for keyword in staff_keywords_in_url):
+                    staff_pages_found += 1
+                
                 # Store page info
                 page_info = {
                     'school_name': school_name,
@@ -259,6 +281,10 @@ class PageDiscoverer:
                     'depth': depth
                 }
                 discovered_pages.append(page_info)
+                
+                # Stop after finding 3 staff pages
+                if staff_pages_found >= 3:
+                    break
                 
                 # Extract links for next level crawl (if not at max depth and not at page limit)
                 if depth < max_depth and len(discovered_pages) < max_pages_per_school:
@@ -286,23 +312,19 @@ class PageDiscoverer:
         # Sort by priority score (highest first)
         discovered_pages.sort(key=lambda x: x['priority_score'], reverse=True)
         
-        # Final filter: prefer only pages at/above the priority threshold
-        high_confidence = [page for page in discovered_pages if page['priority_score'] >= self.min_priority_threshold]
-        if high_confidence:
-            discovered_pages = high_confidence[:top_pages_limit]
-        else:
-            # Fallback: keep at most one best page when nothing meets the threshold
-            discovered_pages = discovered_pages[:min(top_pages_limit, len(discovered_pages), 1)]
+        # Filter out zero-priority pages (contact, admissions) and limit to top 3
+        valid_pages = [page for page in discovered_pages if page['priority_score'] > 0]
+        discovered_pages = valid_pages[:3]  # Max 3 pages per school
         
-        print(f"    Discovered {len(discovered_pages)} high-priority pages (threshold: {self.min_priority_threshold})")
+        print(f"    Discovered {len(discovered_pages)} pages (max 3 staff pages per school)")
         if discovered_pages:
-            print(f"    Top priority pages:")
+            print(f"    Pages found:")
             for page in discovered_pages:
                 print(f"      - {page['title'][:50]} (score: {page['priority_score']})")
         
         return discovered_pages
 
-    def process_schools_csv(self, input_csv: str, output_csv: str, max_depth: int = 3, max_pages_per_school: int = 1000, top_pages_limit: int = 1000):
+    def process_schools_csv(self, input_csv: str, output_csv: str, max_depth: int = 3, max_pages_per_school: int = 3, top_pages_limit: int = 3):
         """
         Process schools from Step 1 CSV and discover all their pages
         

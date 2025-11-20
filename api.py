@@ -51,15 +51,15 @@ def run_pipeline_steps(batch_size=50):
             "schoolsFound": schools_found
         })
         
-        # Step 2: Page Discovery - NO LIMITERS
-        print("Running Step 2: Page Discovery (NO LIMITERS)...")
+        # Step 2: Page Discovery - MAX 3 PAGES PER SCHOOL
+        print("Running Step 2: Page Discovery (MAX 3 PAGES PER SCHOOL)...")
         subprocess.run([
             "python3", "step2.py",
             "--input", "step1_schools.csv",
             "--output", "step2_pages.csv",
-            "--max-pages-per-school", "1000",  # NO LIMIT (practical max)
-            "--top-pages-limit", "1000",  # NO LIMIT (practical max)
-            "--max-depth", "3"  # Increased depth
+            "--max-pages-per-school", "3",  # Max 3 staff pages per school
+            "--top-pages-limit", "3",  # Max 3 pages per school
+            "--max-depth", "3"
         ], check=True, capture_output=True, timeout=3600)  # 60 minute timeout
         
         df2 = pd.read_csv("step2_pages.csv")
