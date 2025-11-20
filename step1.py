@@ -78,7 +78,7 @@ class SchoolSearcher:
                 }
                 
                 data = {'textQuery': query, 'pageSize': 20}
-                response = requests.post(self.base_url, headers=headers, json=data, timeout=15)
+                response = requests.post(self.base_url, headers=headers, json=data, timeout=60)  # Increased timeout
 
                 if response.status_code == 200:
                     result = response.json()
@@ -170,6 +170,50 @@ class SchoolSearcher:
             self.stats['total_schools_found'] = len(self.all_schools)
         elif len(self.all_schools) < sample_size:
             print(f"Warning: Only found {len(self.all_schools)} schools (requested {sample_size})")
+        
+        self._save_to_csv(output_file)
+        self._print_summary(time.time() - start_time, output_file)
+
+    def search_batch_counties(
+        self,
+        counties: List[str],
+        state: str,
+        output_file: str,
+        batch_size: int = 50
+    ):
+        """Search exactly N counties with NO limiters - full batch mode"""
+        print("\n" + "="*70)
+        print(f"BATCH MODE - {state.upper()}")
+        print("="*70)
+        print(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Batch size: {batch_size} counties")
+        print("NO LIMITERS - Searching all terms, all schools found")
+        print("="*70 + "\n")
+        
+        start_time = time.time()
+        
+        # Shuffle counties for randomness, then take batch_size
+        shuffled_counties = counties.copy()
+        random.shuffle(shuffled_counties)
+        batch_counties = shuffled_counties[:batch_size]
+        
+        print(f"Processing batch of {len(batch_counties)} counties...\n")
+        
+        for i, county in enumerate(batch_counties, 1):
+            print(f"[{i}/{len(batch_counties)}] Searching {county} County...")
+            # NO LIMITERS - search all terms, no API call limit
+            county_schools, new_count = self.search_county(
+                county,
+                state,
+                max_search_terms=None,  # No limit - search all terms
+                max_api_calls=None  # No limit - make all API calls needed
+            )
+            
+            self.all_schools.extend(county_schools)
+            self.stats['counties_searched'] = i
+            self.stats['total_schools_found'] = len(self.all_schools)
+            
+            print(f"    Found {new_count} new schools | Total: {self.stats['total_schools_found']}")
         
         self._save_to_csv(output_file)
         self._print_summary(time.time() - start_time, output_file)
@@ -358,6 +402,7 @@ if __name__ == "__main__":
     parser.add_argument('--max-schools', type=int, help='Maximum number of schools to collect (stops early when reached)')
     parser.add_argument('--random-county-sample', type=int, metavar='N', help='Pick a random county and return N random schools (testing mode)')
     parser.add_argument('--multiple-random-counties', type=int, metavar='N', help='Search multiple random counties until N schools are found')
+    parser.add_argument('--batch-counties', type=int, metavar='N', help='BATCH MODE: Search exactly N counties with NO limiters (all terms, all schools)')
     
     args = parser.parse_args()
     
@@ -367,8 +412,16 @@ if __name__ == "__main__":
     searcher = SchoolSearcher(api_key=args.api_key)
     
     try:
+        # If batch-counties is specified, use batch mode (NO LIMITERS)
+        if args.batch_counties is not None:
+            searcher.search_batch_counties(
+                counties,
+                args.state,
+                args.output,
+                batch_size=args.batch_counties
+            )
         # If multiple-random-counties is specified, use that mode
-        if args.multiple_random_counties is not None:
+        elif args.multiple_random_counties is not None:
             searcher.search_multiple_random_counties(
                 counties,
                 args.state,

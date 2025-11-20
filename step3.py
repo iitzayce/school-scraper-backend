@@ -31,9 +31,9 @@ from collections import defaultdict
 
 
 class ContentCollector:
-    def __init__(self, timeout: int = 30, max_retries: int = 3, use_selenium: bool = True):
-        self.timeout = timeout
-        self.max_retries = max_retries
+    def __init__(self, timeout: int = 120, max_retries: int = 5, use_selenium: bool = True):
+        self.timeout = timeout  # Increased to 120 seconds
+        self.max_retries = max_retries  # Increased retries
         self.use_selenium = use_selenium
         self.driver = None
         
@@ -91,7 +91,7 @@ class ContentCollector:
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
         
         driver = webdriver.Chrome(options=chrome_options)
-        driver.set_page_load_timeout(60)
+        driver.set_page_load_timeout(180)  # Increased to 180 seconds
         return driver
     
     def _ensure_driver_healthy(self):
@@ -227,7 +227,7 @@ class ContentCollector:
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
         
         driver = webdriver.Chrome(options=chrome_options)
-        driver.set_page_load_timeout(60)
+        driver.set_page_load_timeout(180)  # Increased to 180 seconds
         return driver
     
     def collect_page_content(self, school_name: str, url: str) -> Optional[Dict]:

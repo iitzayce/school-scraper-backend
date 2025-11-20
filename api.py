@@ -16,9 +16,10 @@ app = Flask(__name__)
 # Enable CORS - allow all origins for now (restrict in production)
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type"]}})
 
-def run_pipeline_steps(max_schools=100):
+def run_pipeline_steps(batch_size=50):
     """
-    Run all 5 pipeline steps and return summary
+    Run all 5 pipeline steps in BATCH MODE with NO LIMITERS
+    Only limit: batch_size counties (default 50)
     """
     summary = {
         "status": "success",
@@ -30,17 +31,15 @@ def run_pipeline_steps(max_schools=100):
     }
     
     try:
-        # Step 1: School Discovery - Search multiple random counties to get target schools
-        print("Running Step 1: School Discovery...")
+        # Step 1: School Discovery - BATCH MODE (NO LIMITERS)
+        print("Running Step 1: School Discovery (BATCH MODE - NO LIMITERS)...")
         subprocess.run([
             "python3", "step1.py",
             "--api-key", os.getenv("GOOGLE_PLACES_API_KEY", ""),
             "--state", "Texas",
-            "--multiple-random-counties", str(max_schools),
-            "--max-search-terms", "10",  # More search terms per county for better coverage
-            "--max-api-calls", "2000",  # Increased API call limit for 100 schools (100 counties × 10 terms = 1000 max, with buffer)
+            "--batch-counties", str(batch_size),  # BATCH MODE: exactly N counties, NO limiters
             "--output", "step1_schools.csv"
-        ], check=True, capture_output=True)
+        ], check=True, capture_output=True, timeout=3600)  # 60 minute timeout
         
         # Read Step 1 results
         df1 = pd.read_csv("step1_schools.csv")
@@ -52,15 +51,16 @@ def run_pipeline_steps(max_schools=100):
             "schoolsFound": schools_found
         })
         
-        # Step 2: Page Discovery
-        print("Running Step 2: Page Discovery...")
+        # Step 2: Page Discovery - NO LIMITERS
+        print("Running Step 2: Page Discovery (NO LIMITERS)...")
         subprocess.run([
             "python3", "step2.py",
             "--input", "step1_schools.csv",
             "--output", "step2_pages.csv",
-            "--max-pages-per-school", "50",  # Increased for better coverage
-            "--top-pages-limit", "5"  # Keep top 5 pages per school
-        ], check=True, capture_output=True)
+            "--max-pages-per-school", "1000",  # NO LIMIT (practical max)
+            "--top-pages-limit", "1000",  # NO LIMIT (practical max)
+            "--max-depth", "3"  # Increased depth
+        ], check=True, capture_output=True, timeout=3600)  # 60 minute timeout
         
         df2 = pd.read_csv("step2_pages.csv")
         pages_found = len(df2)
@@ -69,13 +69,13 @@ def run_pipeline_steps(max_schools=100):
             "pagesDiscovered": pages_found
         })
         
-        # Step 3: Content Collection
-        print("Running Step 3: Content Collection...")
+        # Step 3: Content Collection - NO LIMITERS
+        print("Running Step 3: Content Collection (NO LIMITERS)...")
         subprocess.run([
             "python3", "step3.py",
             "--input", "step2_pages.csv",
             "--output", "step3_content.csv"
-        ], check=True, capture_output=True)
+        ], check=True, capture_output=True, timeout=7200)  # 120 minute timeout for Selenium
         
         df3 = pd.read_csv("step3_content.csv")
         emails_found = df3['email_count'].sum() if 'email_count' in df3.columns else 0
@@ -84,8 +84,8 @@ def run_pipeline_steps(max_schools=100):
             "emailsFound": int(emails_found)
         })
         
-        # Step 4: LLM Parsing
-        print("Running Step 4: LLM Parsing...")
+        # Step 4: LLM Parsing - NO LIMITERS
+        print("Running Step 4: LLM Parsing (NO LIMITERS)...")
         subprocess.run([
             "python3", "step4.py",
             "--input", "step3_content.csv",
@@ -93,7 +93,7 @@ def run_pipeline_steps(max_schools=100):
             "--output-no-emails", "step4_contacts_no_emails.csv",
             "--api-key", os.getenv("OPENAI_API_KEY", ""),
             "--model", "gpt-4o-mini"
-        ], check=True, capture_output=True)
+        ], check=True, capture_output=True, timeout=7200)  # 120 minute timeout for LLM
         
         # Read both CSV files from Step 4
         contacts_with_emails = 0
@@ -181,10 +181,10 @@ def run_pipeline():
     
     try:
         data = request.get_json() or {}
-        max_schools = data.get("maxSchools", 100)  # Default to 100 schools
+        batch_size = data.get("batchSize", 50)  # Default to 50 counties per batch
         
-        # Run pipeline (this will take 2-5 minutes)
-        summary = run_pipeline_steps(max_schools=max_schools)
+        # Run pipeline in BATCH MODE (NO LIMITERS)
+        summary = run_pipeline_steps(batch_size=batch_size)
         
         # Read the final CSV files and include them in response
         if summary.get("status") == "success":

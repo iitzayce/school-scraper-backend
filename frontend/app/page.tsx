@@ -72,7 +72,7 @@ export default function Home() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ maxSchools: 100 }),
+        body: JSON.stringify({ batchSize: 50 }), // BATCH MODE: 50 counties, NO LIMITERS
       });
 
       if (!response.ok) {

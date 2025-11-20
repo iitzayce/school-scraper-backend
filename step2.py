@@ -19,15 +19,15 @@ import pandas as pd
 
 
 class PageDiscoverer:
-    def __init__(self, timeout: int = 30, max_retries: int = 3):
-        self.timeout = timeout
-        self.max_retries = max_retries
+    def __init__(self, timeout: int = 120, max_retries: int = 5):
+        self.timeout = timeout  # Increased to 120 seconds
+        self.max_retries = max_retries  # Increased retries
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
         
         # Configurable thresholds
-        self.min_priority_threshold = 40  # only keep pages at/above this score if possible
+        self.min_priority_threshold = 0  # NO LIMITER - keep all pages regardless of score
         
         # Keywords to prioritize pages likely to have decision-maker info
         self.high_value_keywords = [
@@ -184,7 +184,7 @@ class PageDiscoverer:
         
         return content_score
 
-    def discover_pages(self, school_name: str, base_url: str, max_depth: int = 2, max_pages_per_school: int = 30, top_pages_limit: int = 3) -> List[Dict]:
+    def discover_pages(self, school_name: str, base_url: str, max_depth: int = 3, max_pages_per_school: int = 1000, top_pages_limit: int = 1000) -> List[Dict]:
         """
         Discover all pages on a school website
         
@@ -301,7 +301,7 @@ class PageDiscoverer:
         
         return discovered_pages
 
-    def process_schools_csv(self, input_csv: str, output_csv: str, max_depth: int = 2, max_pages_per_school: int = 30, top_pages_limit: int = 5):
+    def process_schools_csv(self, input_csv: str, output_csv: str, max_depth: int = 3, max_pages_per_school: int = 1000, top_pages_limit: int = 1000):
         """
         Process schools from Step 1 CSV and discover all their pages
         
@@ -370,9 +370,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Discover pages on school websites')
     parser.add_argument('--input', required=True, help='Input CSV from Step 1')
     parser.add_argument('--output', default='step2_pages.csv', help='Output CSV filename')
-    parser.add_argument('--max-depth', type=int, default=2, help='Maximum crawl depth (default: 2)')
-    parser.add_argument('--max-pages-per-school', type=int, default=30, help='Maximum pages to discover per school (default: 30)')
-    parser.add_argument('--top-pages-limit', type=int, default=3, help='Final filter: keep only top N pages per school by priority (default: 3)')
+    parser.add_argument('--max-depth', type=int, default=3, help='Maximum crawl depth (default: 3)')
+    parser.add_argument('--max-pages-per-school', type=int, default=1000, help='Maximum pages to discover per school (default: 1000 - no practical limit)')
+    parser.add_argument('--top-pages-limit', type=int, default=1000, help='Final filter: keep only top N pages per school by priority (default: 1000 - no practical limit)')
     
     args = parser.parse_args()
     
