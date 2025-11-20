@@ -45,13 +45,8 @@ class FinalCompiler:
             'john example', 'jane example', 'test name', 'sample name'
         ]
         
-        # Non-admin role keywords to exclude
-        self.exclude_keywords = [
-            'teacher', 'coach', 'instructor', 'aide', 'assistant teacher',
-            'paraprofessional', 'custodian', 'janitor', 'cook', 'kitchen',
-            'bus driver', 'lunch', 'food service', 'athletics director',
-            'coach', 'librarian', 'counselor'
-        ]
+        # NO FILTERING - LLM handles all filtering
+        # Removed exclude_keywords - not used anymore
     
     def is_valid_email(self, email: str) -> bool:
         """Validate email format and filter generic addresses"""
@@ -70,27 +65,7 @@ class FinalCompiler:
         
         return True
     
-    def is_admin_role(self, title: str) -> bool:
-        """Check if title is an administrative role"""
-        if not title or pd.isna(title):
-            return False
-        
-        title_lower = str(title).lower()
-        
-        # Exclude non-admin roles
-        if any(keyword in title_lower for keyword in self.exclude_keywords):
-            return False
-        
-        # Must contain admin keywords
-        admin_keywords = [
-            'principal', 'superintendent', 'director', 'headmaster', 'head of school',
-            'administrator', 'admin', 'dean', 'president', 'ceo', 'coo', 'cao',
-            'chief', 'executive', 'vice principal', 'assistant principal',
-            'office manager', 'business manager', 'secretary', 'registrar',
-            'coordinator', 'supervisor', 'manager', 'board'
-        ]
-        
-        return any(keyword in title_lower for keyword in admin_keywords)
+    # Removed is_admin_role() - NO FILTERING in Python, LLM handles all filtering
     
     def format_phone(self, phone: str) -> str:
         """Format phone number to standard format"""
@@ -174,47 +149,63 @@ class FinalCompiler:
         """
         Calculate confidence score for a contact (0-100)
         Based on completeness and quality of data
+        NO TITLE FILTERING - just data completeness
         """
         score = 0
         
-        # Email presence (required) - 20 points
-        if self.is_valid_email(row['email']):
-            score += 20
-        
-        # Name completeness - 30 points
-        if row['first_name'] and row['last_name']:
-            score += 30
-        elif row['first_name'] or row['last_name']:
-            score += 15
-        
-        # Title quality - 30 points
-        if row['title']:
-            title_lower = row['title'].lower()
-            # Higher value titles
-            high_value = ['principal', 'superintendent', 'director', 'headmaster', 'president', 'ceo']
-            if any(keyword in title_lower for keyword in high_value):
-                score += 30
-            else:
+        # Email presence (optional) - 20 points if present and valid
+        email = row.get('email', '')
+        if email and not pd.isna(email) and str(email).strip():
+            if self.is_valid_email(email):
                 score += 20
         
+        # Name completeness - 30 points
+        if row.get('first_name') and row.get('last_name'):
+            score += 30
+        elif row.get('first_name') or row.get('last_name'):
+            score += 15
+        
+        # Title presence - 20 points (no quality judgment, just presence)
+        if row.get('title') and not pd.isna(row.get('title')):
+            score += 20
+        
         # Phone presence - 20 points
-        if row['phone']:
+        if row.get('phone') and not pd.isna(row.get('phone')) and str(row.get('phone')).strip():
             score += 20
         
         return min(score, 100)
     
     def deduplicate_contacts(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Remove duplicate contacts based on email address
+        Remove duplicate contacts
+        - If email exists: dedupe by email
+        - If no email: dedupe by name + school_name
         Keep the one with highest confidence score
         """
         # Sort by confidence score (descending)
         df = df.sort_values('confidence_score', ascending=False)
         
-        # Drop duplicates keeping first (highest score)
-        df = df.drop_duplicates(subset=['email'], keep='first')
+        # Separate contacts with and without emails
+        df_with_email = df[df['email'].notna() & (df['email'] != '')].copy()
+        df_no_email = df[df['email'].isna() | (df['email'] == '')].copy()
         
-        return df
+        # Dedupe contacts with emails by email
+        if not df_with_email.empty:
+            df_with_email = df_with_email.drop_duplicates(subset=['email'], keep='first')
+        
+        # Dedupe contacts without emails by name + school_name
+        if not df_no_email.empty:
+            df_no_email = df_no_email.drop_duplicates(subset=['name', 'school_name'], keep='first')
+        
+        # Combine back
+        if not df_with_email.empty and not df_no_email.empty:
+            return pd.concat([df_with_email, df_no_email]).reset_index(drop=True)
+        elif not df_with_email.empty:
+            return df_with_email.reset_index(drop=True)
+        elif not df_no_email.empty:
+            return df_no_email.reset_index(drop=True)
+        else:
+            return df.reset_index(drop=True)
     
     def compile_final_csv(self, input_csv: str, output_csv: str):
         """
@@ -236,22 +227,20 @@ class FinalCompiler:
         # Clean and validate
         print("\nCleaning and validating...")
         
-        # Validate emails
-        # Email validation - allow empty emails (for enrichment CSV)
-        # If email is empty, it's valid (we want to keep it for enrichment)
-        # If email is not empty, validate it
+        # Validate emails (only format validation, don't filter empty emails)
+        # Empty emails are valid - we want to keep contacts without emails
+        # Only validate format if email is present
         df['email_valid'] = df['email'].apply(lambda x: True if (pd.isna(x) or str(x).strip() == '') else self.is_valid_email(x))
         df = df[df['email_valid'] == True]
-        print(f"  After email validation: {len(df)}")
+        print(f"  After email validation: {len(df)} (empty emails kept)")
         
-        # Validate names (filter out generic text)
+        # Validate names (filter out generic text/placeholders only)
         df['name_valid'] = df['name'].apply(self.is_valid_name)
         df = df[df['name_valid'] == True]
         print(f"  After name validation (removed generic text): {len(df)}")
         
-        # Skip admin role validation - Step 4 already filters by target titles
-        # All contacts from Step 4 already match target titles
-        print(f"  Skipping role validation (Step 4 already filtered by target titles)")
+        # NO ROLE FILTERING - LLM handles all title filtering
+        print(f"  Skipping role validation (LLM handles all filtering)")
         
         # Check if dataframe is empty
         if len(df) == 0:

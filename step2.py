@@ -225,8 +225,9 @@ class PageDiscoverer:
             if len(discovered_pages) >= max_pages_per_school:
                 break
             
-            # Skip low-priority pages if we already have enough high-priority ones
-            if high_priority_found >= top_pages_limit and priority_estimate < 40:
+            # Skip low-priority pages only if we have MANY high-priority ones (increased threshold)
+            # Changed from 40 to 20 to be less aggressive - still get medium-priority staff pages
+            if high_priority_found >= top_pages_limit and priority_estimate < 20:
                 continue
             
             visited.add(current_url)
@@ -270,9 +271,9 @@ class PageDiscoverer:
                             link_priority = self.score_page_priority(link)
                             scored_links.append((link, link_priority))
                     
-                    # Sort by priority and add top links first (limit to top 20 per page to avoid explosion)
+                    # Sort by priority and add top links first (increased to 75 per page for comprehensive coverage)
                     scored_links.sort(key=lambda x: x[1], reverse=True)
-                    for link, link_priority in scored_links[:20]:
+                    for link, link_priority in scored_links[:75]:
                         if link not in visited and len(discovered_pages) < max_pages_per_school:
                             heapq.heappush(to_visit, (-link_priority, depth + 1, link))
                 

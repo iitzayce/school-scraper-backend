@@ -1,32 +1,276 @@
 """
-STEP 4: PARSE HTML WITH LLM (WITH INTELLIGENT ROLE FILTERING)
+STEP 4: PARSE HTML WITH LLM (ALL FILTERING BY LLM)
 ================================================================
-Take ALL raw HTML from Step 3 and use GPT to extract and filter contacts.
+Take ALL raw HTML from Step 3 and use GPT to extract contacts.
 
-INTELLIGENT FILTERING via LLM:
-- LLM extracts all contacts from the page
-- LLM intelligently matches titles to target roles (handles misspellings, variations)
-- LLM excludes non-target roles (coaches, teachers, etc.)
-- Returns only decision-makers: Principals, Directors, IT, Facilities, Security, Operations, Finance
-
-Validation:
-- Name exists and is not empty
-- Title exists and is not empty
-- Email exists and is not empty
-- Role filtering handled by LLM prompt (intelligent matching)
+IMPORTANT: NO FILTERING IN PYTHON CODE - ALL FILTERING DONE BY LLM
+- HTML reduction and chunking only (pre-processing)
+- LLM does all title filtering, exclusion logic, etc.
+- Extract contacts with AND without emails
 
 Input: CSV from Step 3 with ALL raw HTML content
-Output: CSV with filtered contacts matching target roles (name, title, email, phone)
+Output: CSV with contacts (name, title, email, phone) - LLM filtered
 """
 
 from openai import OpenAI
 import pandas as pd
-import json
+import csv
+import io
 import time
 from typing import List, Dict, Optional
 import re
 from bs4 import BeautifulSoup
-from difflib import SequenceMatcher
+
+
+# New CSV-based prompt (from ChatGPT conversation)
+ADMIN_CONTACT_EXTRACTION_PROMPT = """You are an information-extraction assistant helping a web scraper for Nonprofit Security Advisors.
+
+INPUT
+- You receive:
+  - The school or organization name (metadata, not a person).
+  - The page URL (metadata, not a person).
+  - The FULL HTML of a single web page OR a contiguous CHUNK of that HTML from a single page.
+- The HTML may contain tables, lists, "staff" or "faculty & leadership" pages, sidebars, footers, etc.
+- Treat each call independently: only use the HTML text you are given in this call.
+
+GOAL
+From ONLY the information actually present in the provided HTML (or HTML chunk), extract SCHOOL ADMINISTRATIVE CONTACTS and return them as clean CSV-style data with the following columns, in this exact order:
+
+First Name,Last Name,Title,Email,Phone
+
+CRITICAL: EXCLUSION TAKES ABSOLUTE PRIORITY
+Before extracting ANY contact, you MUST check if their title contains ANY exclusion keyword. If it does, DO NOT extract that contact, regardless of what other words appear in the title. Exclusion rules override inclusion rules completely.
+
+REQUIREMENTS & RULES
+
+1. GENERAL BEHAVIOR
+- Read and analyze ALL relevant parts of the provided HTML (tables, cards, lists, headings, mailto: links, tel: links, etc.).
+- Do NOT invent or guess any data that is not clearly present in this HTML chunk.
+- Keep each person's name, title, email, and phone correctly matched.
+- Return only real people (no departments, offices, generic inboxes, or anonymous contacts).
+- If a field is missing, leave it EMPTY but keep the comma (so each row always has 5 columns).
+- If a contact appears to be cut off or incomplete because the chunk ends in the middle of their data, IGNORE that partial contact and do not output them.
+
+2. WHO TO INCLUDE (ADMINISTRATIVE CONTACTS ONLY)
+Include a contact if their role is clearly ADMINISTRATIVE in a K–12 or higher-ed context.
+
+POSITIVELY include titles that clearly indicate school leadership or administration, including but not limited to (case-insensitive, including variations and minor typos):
+- principal, acting principal, interim principal, primary principal, secondary principal
+- assistant principal, associate principal, vice principal, vice-principal, deputy principal
+- superintendent, superintendant
+- head of school, headmaster, headmistress
+- school administrator, school administration, academic administrator
+- director of schools, school director
+- chief academic officer, academic dean, dean of students (only if obviously an admin role)
+- executive principal, executive director (of the school or district)
+- lower school principal, head of lower school, lower school dean
+- middle school principal, head of middle school, middle school dean
+- upper school principal, head of upper school, upper school dean
+- primary school principal, head of primary, elementary principal, high school principal
+- president, school president, college president, university president
+- chancellor, provost, chief operating officer, chief executive officer (when clearly a school/org leader)
+
+ALSO include the following administrative / operational titles (and close variants):
+- Information Technology Director, Director of Technology, IT Director, Technology Manager
+- CTO, Chief Technology Officer
+- Facilities Director, Director of Facilities, Facilities Manager, Facility Manager, Plant Operations (when clearly facilities/operations)
+- Security Director, Director of Security, Security Manager, Campus Security, Safety & Security (when clearly security/safety leadership)
+- Other "Director of …" roles that clearly relate to school-wide administration or operations
+  (e.g., Director of Communications, Director of Family Outreach, Director of Operations, Director of Administration).
+
+If a title clearly indicates they help run or administrate the school, district, campus, or major operations, treat them as administrative and include them.
+
+3. WHO TO EXCLUDE (DO NOT RETURN) - COMPREHENSIVE BLOCKLIST
+Exclude ALL of the following, even if they have an email/phone. If a title contains ANY of these keywords or phrases (case-insensitive), EXCLUDE that contact immediately:
+
+A. TEACHERS & INSTRUCTIONAL STAFF (ALL TYPES):
+- teacher, teachers, teaching, faculty, professor, professors, instructor, instructors, lecturer, lecturers
+- classroom teacher, homeroom teacher, art teacher, music teacher, science teacher, math teacher, english teacher
+- reading teacher, writing teacher, language teacher, foreign language teacher, spanish teacher, french teacher
+- history teacher, social studies teacher, physical education teacher, PE teacher, P.E. teacher
+- special education teacher, special ed teacher, resource teacher, intervention teacher
+- substitute teacher, student teacher, teaching assistant, teacher's aide, paraeducator, paraprofessional
+- department chair (if they are primarily a teacher), curriculum coordinator (if primarily instructional)
+
+B. COUNSELORS & STUDENT SUPPORT STAFF (ALL TYPES):
+- counselor, counselors, counselling, counseling, guidance counselor, school counselor
+- college counselor, college counseling, academic counselor, academic counseling
+- social worker, school social worker, psychologist, school psychologist, therapist, school therapist
+- mental health counselor, behavioral counselor, student support, student services
+- chaplain, campus ministry, pastor, minister, religious coordinator, spiritual director
+- student advocate, case manager (if student-facing), intervention specialist (if counseling-related)
+
+C. ATHLETICS & SPORTS (ALL TYPES):
+- athletic director, athletics director, director of athletics, director of athletics and activities
+- coach, coaches, head coach, assistant coach, associate coach, volunteer coach
+- athletic coordinator, sports coordinator, athletics coordinator
+- PE director, P.E. director, physical education director, director of physical education
+- director of PE and wellness, wellness director (if PE-related)
+- sports performance, athletic trainer, trainer, strength and conditioning coach
+- intramural director, activities director (if primarily athletics)
+- any title containing: athletic, athletics, sports, sport, coach, coaching, PE, P.E., physical education
+
+D. ADMISSIONS & ENROLLMENT (ALL TYPES):
+- admissions director, director of admissions, admissions coordinator, admissions counselor
+- admissions officer, admissions manager, admissions assistant, admissions specialist
+- enrollment director, director of enrollment, enrollment coordinator, enrollment manager
+- enrollment officer, enrollment counselor, enrollment specialist, enrollment assistant
+- registrar, registrars, registrar's office, registration coordinator
+- recruiting, recruiter, student recruiter, admissions recruiter
+- outreach for admissions, admissions outreach, enrollment outreach
+- graduate admissions, undergraduate admissions, admissions and marketing
+- any title containing: admissions, admission, enrollment, enroll, registrar, recruiting, recruiter
+
+E. MARKETING & COMMUNICATIONS (ALL TYPES):
+- marketing director, director of marketing, marketing manager, marketing coordinator
+- marketing specialist, marketing assistant, communications director, director of communications
+- communications manager, communications coordinator, communications specialist
+- public relations director, PR director, director of public relations
+- media relations, media coordinator, social media manager, social media coordinator
+- brand manager, marketing and communications, marcom director, marketing and enrollment
+- development and marketing, advancement and marketing, marketing and outreach
+- any title containing: marketing, market, communications, communication, PR, public relations, media relations, social media
+
+F. OFFICE ADMINISTRATORS & SUPPORT STAFF (ALL TYPES):
+- office administrator, office manager, office assistant, office coordinator
+- administrative assistant, admin assistant, executive assistant, personal assistant
+- secretary, secretaries, receptionist, front desk, office staff, office support
+- office coordinator, administrative coordinator, operations assistant
+- billing coordinator, student billing, accounts receivable, accounts payable (if office/admin role)
+- data entry, administrative support, clerical, office clerk
+- any title containing: office admin, office administrator, office manager, office assistant, secretary, receptionist, administrative assistant
+
+G. OTHER EXCLUSIONS:
+- Food & dining: food service, cafeteria, nutrition, dining services, food manager, lunch coordinator, kitchen manager
+- Board & governance: board member, board of directors, board of trustees, trustee, governor, regent, advisory board
+- Health services: nurse, health office, school nurse, health services, health coordinator (unless also main administrator)
+- Advancement & fundraising: advancement, development, fundraising, alumni relations, donor relations, development office
+- Preschool: preschool director, director of preschool, early childhood director (not targeting preschool admins)
+- Residential: director of residential services, residential services director, dorm director, housing director
+- Transition services: director of transition services, transition services director, transition coordinator
+- Family outreach: director of family outreach, family outreach director, parent coordinator (if primarily outreach)
+- Any roles that clearly indicate regular faculty, coaching, counseling, chaplaincy, student-facing support, or non-administrative operations rather than core school administration.
+
+IMPLEMENTATION TIP - STRICT EXCLUSION RULES:
+If a title contains ANY of these exclusion keywords or phrases (case-insensitive), EXCLUDE that contact immediately, even if other words might sound administrative.
+
+HOW TO CHECK: For each contact's title, convert it to lowercase and check if ANY of the blocklist keywords appear as a substring. Partial matches count. For example:
+- "Athletic Director" contains "athletic" → EXCLUDE
+- "Office Manager" contains "office manager" → EXCLUDE
+- "PE/Athletic Director" contains both "PE" and "athletic" → EXCLUDE
+- "Marketing & Communications" contains both "marketing" and "communications" → EXCLUDE
+- "Administrative Assistant" contains "administrative assistant" → EXCLUDE
+
+BLOCKLIST KEYWORDS (case-insensitive substring matching - if title contains ANY of these, EXCLUDE):
+teacher, teachers, teaching, faculty, professor, instructors, lecturer, classroom, homeroom,
+counselor, counselors, counselling, counseling, guidance, "social worker", psychologist, therapist, chaplain, pastor, minister,
+athletic, athletics, sports, sport, coach, coaches, coaching, PE, "P.E.", "physical education",
+admissions, admission, enrollment, enroll, registrar, recruiting, recruiter,
+marketing, market, communications, communication, "public relations", PR, "social media", "media relations",
+"office admin", "office administrator", "office manager", "office assistant", secretary, secretaries, receptionist, "administrative assistant", "executive assistant",
+cafeteria, nutrition, dining, "food service", lunch,
+board, trustee, governor, regent,
+nurse, "health services", "health office",
+advancement, development, fundraising, alumni, "donor relations",
+preschool, "early childhood",
+residential, dorm, housing,
+transition, outreach (if combined with admissions/family/marketing).
+
+CRITICAL ENFORCEMENT RULES:
+1. Exclusion takes ABSOLUTE PRIORITY over inclusion
+2. If a title contains ANY blocklist keyword (even as part of another word), EXCLUDE it
+3. Do NOT extract contacts with excluded titles, even if they have emails or seem important
+4. Do NOT try to include excluded titles even if they also contain words like "director" or "administrator"
+5. When in doubt about a title, check it against the blocklist first - if it matches, exclude it
+
+MANDATORY PRE-OUTPUT VALIDATION:
+Before outputting ANY contact to the CSV, you MUST perform this check:
+1. Read the contact's title (case-insensitive)
+2. Check if the title contains ANY word from the blocklist keywords above
+3. If YES → DO NOT OUTPUT THIS CONTACT. Skip it entirely.
+4. If NO → Proceed to check if it matches inclusion criteria
+
+EXAMPLES OF TITLES TO EXCLUDE (DO NOT EXTRACT):
+- "PE/Athletic Director" → Contains "athletic" → EXCLUDE
+- "Office Manager" → Contains "office manager" → EXCLUDE
+- "Administrative Assistant" → Contains "administrative assistant" → EXCLUDE
+- "Office Administrator" → Contains "office administrator" → EXCLUDE
+- "Marketing & Communications Coordinator" → Contains "marketing" AND "communications" → EXCLUDE
+- "Director of Athletics" → Contains "athletic" → EXCLUDE
+- "Office Assistant" → Contains "office assistant" → EXCLUDE
+- "Middle School Art Teacher" → Contains "teacher" → EXCLUDE
+- "Athletic Trainer" → Contains "athletic" → EXCLUDE
+- "ES Office Administrator" → Contains "office administrator" → EXCLUDE
+- "MS/HS Office Administrator" → Contains "office administrator" → EXCLUDE
+
+These titles MUST NOT appear in your output, even if they have emails or seem important.
+
+4. NAME, EMAIL, AND PHONE RULES
+- Split names into First Name and Last Name. Middle names or initials go with the first name field.
+  Example: "Ann M. Horne" → First Name: Ann M. , Last Name: Horne
+- Use proper capitalization for names and titles when possible.
+- Emails:
+  - Use the personal work email associated with that person (often in mailto: links or near their name).
+  - Do NOT return generic emails like info@, office@, contact@, unless that is clearly the only email directly labeled as that person's email.
+- Phones:
+  - If multiple phone numbers appear, choose the direct line next to the person's name, or the main office number if that is clearly associated with them.
+  - Preserve phone number formatting as shown on the page, including extensions (e.g., 555-123-4567 ext. 241).
+  - If no phone is clearly linked to that person, leave Phone empty.
+
+5. DATA QUALITY & DEDUPLICATION
+- Do NOT mix up data between people. Each row must belong to one specific person.
+- If the same person appears multiple times with identical details inside this chunk, only keep ONE row.
+- If the same person appears with slightly different information, keep the most complete version (more fields filled in).
+
+5B. FINAL EXCLUSION CHECK (MANDATORY BEFORE OUTPUT):
+Before writing ANY contact to the CSV output, you MUST:
+1. Read the contact's Title field
+2. Convert it to lowercase
+3. Check if it contains ANY word from the blocklist (teacher, athletic, office manager, marketing, communications, administrative assistant, counselor, admissions, enrollment, etc.)
+4. If the title contains ANY blocklist keyword → DO NOT OUTPUT THIS CONTACT
+5. Only proceed to output if the title passes the exclusion check
+
+Remember: "PE/Athletic Director" → EXCLUDE (contains "athletic")
+Remember: "Office Manager" → EXCLUDE (contains "office manager")
+Remember: "Marketing Coordinator" → EXCLUDE (contains "marketing")
+Remember: "Administrative Assistant" → EXCLUDE (contains "administrative assistant")
+Remember: Any title with "teacher", "coach", "counselor", "admissions", "enrollment", "marketing", "communications", "office admin", "office manager", "office assistant", "athletic", "athletics" → EXCLUDE
+
+6. OUTPUT FORMAT (CSV)
+- Output ONLY CSV text. No explanations, no notes, no markdown.
+- The first line MUST be this exact header:
+
+First Name,Last Name,Title,Email,Phone
+
+- Each subsequent line is one contact, with exactly 5 comma-separated fields.
+- If a field itself contains a comma, wrap that field in double quotes and escape any internal double quotes by doubling them (standard CSV rules).
+
+FINAL VALIDATION BEFORE OUTPUT:
+For EACH contact you are about to output:
+1. Check the title against the blocklist keywords
+2. If title contains ANY blocklist keyword → DO NOT OUTPUT THIS ROW
+3. Only output contacts that pass the exclusion check AND match inclusion criteria
+
+Example of correct formatting (only valid administrative contacts):
+
+First Name,Last Name,Title,Email,Phone
+Jacqueline,Wright,Principal,jwright@holytrinitychs.org,254-771-0787
+Michael,Johnson,Assistant Principal,mjohnson@school.org,555-123-4567
+Sarah,Williams,IT Director,swilliams@school.org,555-987-6543
+
+DO NOT output contacts with titles like:
+- "Office Manager" (blocked)
+- "PE/Athletic Director" (blocked)
+- "Marketing Coordinator" (blocked)
+- "Administrative Assistant" (blocked)
+- Any title containing exclusion keywords (blocked)
+
+- If no valid administrative contacts are found in this HTML chunk, output only the header row and nothing else.
+
+7. IMPORTANT CONSTRAINTS
+- Use only the information in the provided HTML (or HTML chunk).
+- Do not reference these instructions or your own reasoning in the output.
+- Do not output JSON, markdown, or any additional text — only the CSV as specified above."""
 
 
 class LLMParser:
@@ -36,531 +280,373 @@ class LLMParser:
         
         Args:
             api_key: OpenAI API key
-            model: Model to use (default: gpt-3.5-turbo)
+            model: Model to use (default: gpt-4o-mini)
         """
         self.api_key = api_key
         self.model = model
         self.client = OpenAI(api_key=api_key)
-        
-        # Target titles to filter for (with fuzzy matching)
-        # Focus on decision-makers relevant to security grants (per Nonprofit Security Advisors):
-        # - Budget/operations decision-makers (Principal, Superintendent, Director of Operations/Finance)
-        # - Facilities/security oversight (Facilities Director, Security Director)
-        # - IT infrastructure (IT Director, CTO)
-        self.target_titles = [
-            # Principal variants (top decision makers)
-            'principal', 'superintendent', 'superintendant',  # Note: both spellings
-            'assistant principal', 'head of school', 'acting principal',
-            'vice principal', 'vice-principal', 'director of schools',
-            'secondary principal', 'interim principal', 'school administrator',
-            'deputy principal', 'headmaster', 'executive principal',
-            'primary principal', 'head of primary', 'lower school principal',
-            'head of lower school', 'head of upper school',
-            # Operations/Finance (budget decision makers)
-            'chief academic officer', 'school director', 'director of operations',
-            'director of finance', 'business manager', 'operations director',
-            'finance director', 'chief financial officer', 'cfo',
-            'director of finance and operations', 'chief operating officer', 'coo',
-            # IT/Technology (security infrastructure)
-            'information technology director', 'it director', 'technology director',
-            'cto', 'chief technology officer', 'director of technology',
-            # Facilities (physical security)
-            'facilities director', 'facilities manager', 'director of facilities',
-            # Security (security oversight)
-            'security director', 'security manager', 'director of security', 
-            'chief security officer'
-        ]
-        
-        # Titles to EXCLUDE (not relevant to security grants)
-        # These roles don't make budget/security decisions for facilities
-        self.exclude_titles = [
-            # Athletics (not relevant to security grants)
-            'athletic director', 'athletics director', 'athletics',
-            'coach', 'athletic coach', 'sports director',
-            # Admissions (not a decision-maker for security grants)
-            'director of admissions', 'admissions director', 'admissions coordinator',
-            # Academic roles (curriculum-focused, not operations)
-            'academic dean', 'lower school dean', 'upper school dean', 
-            'dean of students', 'dean of academics',
-            # Activities (not operations)
-            'activities director', 'student activities director',
-            'student life director',
-            # Arts/Curriculum (academic-focused)
-            'music director', 'arts director', 'fine arts director', 'art director',
-            'curriculum director', 'academic director', 'director of curriculum',
-            # Library (academic/operational support, not security)
-            'library director', 'librarian',
-            # Other non-decision-maker roles
-            'teacher', 'instructor', 'guidance counselor', 'counselor'
-        ]
     
-    def extract_text_from_html(self, html: str, max_length: int = None) -> str:
+    def reduce_html(self, html: str) -> str:
         """
-        Extract clean text from HTML, removing scripts/styles
-        NO TRUNCATION - GPT-4o-mini supports 128k tokens (~500k chars)
-        Extract full content to ensure nothing is missed
+        Reduce HTML to only "people sections" - keeps blocks likely to contain staff/contact info
+        
+        Args:
+            html: Raw HTML content
+            
+        Returns:
+            Reduced HTML string containing only people sections
         """
         if not html:
             return ""
         
         soup = BeautifulSoup(html, 'html.parser')
         
-        # Remove unwanted elements
-        for element in soup(['script', 'style', 'meta', 'link', 'noscript', 'header', 'footer', 'nav']):
+        # Remove unwanted elements completely
+        for element in soup(['script', 'style', 'noscript', 'svg', 'iframe', 'link']):
             element.decompose()
         
-        # Get all text
-        all_text = soup.get_text(separator='\n', strip=True)
+        # Remove comments
+        from bs4 import Comment
+        for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+            comment.extract()
         
-        # Clean up excessive whitespace
-        all_text = re.sub(r'\n\s*\n', '\n\n', all_text)
-        all_text = re.sub(r' +', ' ', all_text)
+        # Staff keywords to look for
+        staff_keywords = [
+            'staff', 'faculty', 'directory', 'leadership', 'administration', 
+            'administrative', 'principal', 'superintendent', 'head of school', 
+            'dean', 'director'
+        ]
         
-        # NO TRUNCATION - return full text
-        # GPT-4o-mini supports 128k tokens, which is ~500k characters
-        # Most pages are well under this limit
-        return all_text
+        # Conditionally remove header/footer/nav/aside ONLY if they don't contain staff keywords
+        for tag_name in ['header', 'footer', 'nav', 'aside']:
+            for element in soup.find_all(tag_name):
+                element_text = element.get_text().lower()
+                if not any(keyword in element_text for keyword in staff_keywords):
+                    element.decompose()
+        
+        # Keep only blocks that are likely to contain people/staff information
+        people_sections = []
+        
+        # Find all block-level elements
+        for element in soup.find_all(['section', 'div', 'table', 'ul', 'article']):
+            element_text = element.get_text().lower()
+            
+            # Check if this block contains staff keywords
+            has_staff_keywords = any(keyword in element_text for keyword in staff_keywords)
+            
+            # Check if this block has email + name pattern
+            has_email = '@' in element_text
+            has_name_pattern = bool(re.search(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', element.get_text()))
+            
+            # Keep if it has staff keywords OR (email AND name pattern)
+            if has_staff_keywords or (has_email and has_name_pattern):
+                people_sections.append(str(element))
+        
+        # If no people sections found, fallback to full HTML (but cleaned)
+        # This ensures we don't miss contacts in non-standard layouts
+        if not people_sections:
+            # Fallback: return cleaned full HTML (remove scripts/styles but keep content)
+            # This will be chunked properly to stay within token limits
+            cleaned_html = soup.prettify()
+            return cleaned_html
+        
+        # Concatenate sections in original order
+        reduced_html = '\n'.join(people_sections)
+        
+        return reduced_html
     
-    def create_parsing_prompt(self, html_text: str, school_name: str) -> str:
+    def chunk_html(self, html: str, max_chunk_size: int = 40000) -> List[str]:
         """
-        Create prompt for LLM to extract and intelligently filter contact information
+        Split HTML into chunks of approximately max_chunk_size characters
+        Intelligently splits on block boundaries to avoid cutting contact cards in half
+        Ensures contacts (name + email/title) stay together within chunks
         
-        The LLM will:
-        1. Extract ALL contacts from the page
-        2. Intelligently match titles to target roles (handling variations, misspellings)
-        3. Exclude non-target roles
-        4. Return only filtered contacts
+        Args:
+            html: HTML string to chunk
+            max_chunk_size: Maximum characters per chunk (default: 40,000)
+            
+        Returns:
+            List of HTML chunks
         """
+        if not html or len(html) <= max_chunk_size:
+            return [html]
         
-        # Build target roles list for prompt
-        target_roles_text = """
-TARGET ROLES (Include these - decision-makers for security grants):
-- Principals: Principal, Head of School, Superintendent, Superintendant (both spellings), 
-  Assistant Principal, Vice Principal, Acting Principal, Interim Principal, 
-  Lower/Middle/High School Principal, Headmaster, Executive Principal
-- Directors: Director of Operations, Director of Finance, Director of IT/Technology, 
-  Director of Facilities, Director of Security, Director of Business, 
-  School Director, Director of Schools
-- Managers: Facilities Manager, Security Manager, Operations Manager, Business Manager
-- Executives: CFO (Chief Financial Officer), COO (Chief Operating Officer), 
-  CTO (Chief Technology Officer), Chief Academic Officer
-- IT/Technology: IT Director, Technology Director, Director of Technology, 
-  IT Manager, IT Assistant (include assistants in IT roles)
-- Facilities: Facilities Director, Facilities Manager, Director of Facilities, 
-  Maintenance Supervisor (if oversees facilities)
-- Security: Security Director, Security Manager, Director of Security, 
-  Chief Security Officer
-- Operations/Finance: Operations Director, Finance Director, Business Manager, 
-  Director of Finance and Operations
-
-Use INTELLIGENT MATCHING:
-- Handle misspellings: "Superintendant" = "Superintendent"
-- Handle variations: "Head of School" = "Principal", "IT Director" = "Technology Director"
-- Handle synonyms: "Facilities Manager" = "Building Manager" (if context suggests facilities)
-- Include assistants in IT/Facilities roles: "IT Assistant" (include), "Facilities Assistant" (include)
-- Match partial titles: "Director" with "IT" or "Facilities" or "Security" in context
-"""
+        chunks = []
         
-        exclude_roles_text = """
-EXCLUSION ROLES (Exclude these - not decision-makers for security grants):
-- Athletics: Athletic Director, Athletics Director, Coach, Head Coach, Sports Director, 
-  Varsity Coach, Assistant Coach, Athletic Coordinator
-- Academic: Academic Dean, Dean of Students, Dean of Academics, Curriculum Director, 
-  Academic Director, Director of Curriculum
-- Admissions: Director of Admissions, Admissions Director, Admissions Coordinator
-  (These are NOT decision-makers for security grants)
-- Teachers: Teacher, Instructor (unless also has admin title like "Principal")
-- Support Staff: Counselor, Guidance Counselor, Librarian, Library Director, 
-  Registrar, Receptionist, Aide, Assistant (unless IT/Facilities)
-- Arts/Activities: Music Director, Arts Director, Fine Arts Director, 
-  Activities Director, Student Activities Director, Student Life Director
-- Other: Morning Care, Extended Care (unless Director level)
-
-EXCLUSION RULES:
-- If title is ONLY "Teacher", "Coach", "Counselor" → EXCLUDE
-- If title contains "Athletic" or "Athletics" → EXCLUDE
-- If title contains "Admissions" → EXCLUDE (e.g., "Director of Admissions", "Admissions Director")
-- If title is "Assistant" without IT/Facilities context → EXCLUDE
-- If title is generic like "Admissions", "Connect", "Administration" (not a person) → EXCLUDE
-"""
+        # Priority order for split points (most likely to preserve contact cards)
+        # </li> is often a contact card boundary
+        # </tr> is often a table row with contact info
+        # </div> with class/id containing staff/contact keywords
+        block_delimiters = ['</li>', '</tr>', '</div>', '</section>', '</article>', '</td>']
         
-        prompt = f"""You are an expert at extracting and filtering contact information from school websites.
-
-Extract contact information from the following text from {school_name}'s website.
-
-CRITICAL RULE: ZERO GUESSING - ONLY EXTRACT WHAT YOU CAN ACTUALLY SEE
-
-ABSOLUTE PROHIBITIONS (DO NOT VIOLATE THESE):
-- DO NOT guess, infer, assume, or create ANY data
-- DO NOT match names to titles unless they appear TOGETHER on the page
-- DO NOT match names to emails unless they appear TOGETHER on the page
-- DO NOT create emails based on name patterns (e.g., "John Smith" → "jsmith@school.edu")
-- DO NOT assign titles to names if they are not clearly associated on the page
-- DO NOT use placeholder names: "John Doe", "Jane Smith", "Test User", etc.
-- DO NOT extract generic page text as names: "About", "Admissions", "Contact Us"
-- DO NOT infer relationships - if name and title are on different parts of the page, DO NOT match them
-- DO NOT fill in missing data - if email is missing, DO NOT include the contact
-- DO NOT use "best guess" or "likely" - ONLY use what is EXPLICITLY visible
-
-STEP 1: EXTRACTION (STRICT RULES)
-1. Extract contacts where you can see name and title together (email is OPTIONAL - see below)
-2. If an email is visible, it MUST appear on the same line or immediately near the person's name
-3. DO NOT create, infer, guess, or assume email addresses - ONLY extract emails that are EXPLICITLY displayed
-4. If no email is visible near a person's name, still extract the contact but leave email as empty string ""
-5. DO NOT use placeholder names like "John Doe", "John Smith", "Jane Doe", "Bob Jones", "Test User", or any generic names
-6. Match each person's name with their ACTUAL title/role that appears IMMEDIATELY NEXT TO or ON THE SAME LINE as their name
-7. Name and title MUST appear together - if they are separated, DO NOT match them
-8. DO NOT extract generic page text as names. Common mistakes to avoid:
-   - Navigation links: "About", "Admissions", "Contact Us", "Home", "Staff Directory"
-   - Page headings: "About Us", "School Information", "General Information"
-   - Section labels: "Faculty", "Administration", "Our Team"
-   - Generic departments: "Admissions", "Athletics", "Administration" (unless it's clearly a person's name)
-   - These are NOT person names - they are page elements
-9. Person names are typically 2-4 words (first name, middle name/initial, last name)
-   - Real examples: "Mary Johnson", "Robert T. Williams", "Dr. Sarah Martinez"
-   - NOT: "John Doe", "Jane Smith", "About", "Admissions", "Contact Us"
-10. Extract contacts if you can see name and title together - email is OPTIONAL (can be empty string "")
-
-STEP 2: INTELLIGENT ROLE FILTERING
-{target_roles_text}
-
-{exclude_roles_text}
-
-FILTERING INSTRUCTIONS:
-- Extract contacts from the page where name and title are visible together (email is OPTIONAL)
-- For each contact, determine if their title matches TARGET ROLES using intelligent matching
-- Handle misspellings, variations, and synonyms intelligently (e.g., "Superintendant" = "Superintendent")
-- If title matches EXCLUSION ROLES, exclude that contact
-- If title is ambiguous, use context clues (e.g., "Assistant" in IT department = include)
-- Return contacts that:
-  1. Have name and title visible together on the page (email is OPTIONAL - can be empty string "")
-  2. Match TARGET ROLES (using intelligent matching)
-  3. Do NOT match EXCLUSION ROLES
-
-STEP 3: OUTPUT FORMAT
-Each contact MUST have:
-- name: Actual person name visible on the page (NOT placeholder names or generic text)
-- title: Their EXACT role from the page (as it appears, must be visible near the name)
-- email: Email address if VISIBLY SHOWN on the page (NOT inferred or created, must be visible near the name), otherwise empty string ""
-- phone: Phone number if visible, otherwise empty string ""
-
-CRITICAL: Name and title MUST be visible together - email is OPTIONAL (can be empty string "").
-CRITICAL: DO NOT guess which email belongs to which person - only match if they appear together.
-CRITICAL: DO NOT guess which title belongs to which person - only match if they appear together.
-CRITICAL: Extract contacts matching TARGET ROLES even if they don't have visible emails - leave email as "".
-Return ONLY valid JSON array format - no markdown, no explanation.
-
-MATCHING RULES (critical for accuracy - STRICT ENFORCEMENT):
-- Name and title MUST appear on the SAME LINE or immediately adjacent lines
-- If an email is visible, it MUST appear on the SAME LINE or immediately adjacent lines to the name
-- If name and title are visible together, extract the contact (email is OPTIONAL - can be empty string "")
-- DO NOT create emails based on name patterns (e.g., don't create "jdoe@" from "John Doe")
-- DO NOT assign a title to a name if they are not clearly associated on the same line/area
-- DO NOT mix up names and titles from different people on the page
-- DO NOT assume relationships - only use what is explicitly visible
-- If you see a name and title together but no email visible, STILL extract the contact with email as ""
-- If you see an email but no name visible near it, DO NOT include that contact
-- If you see a name but no title visible near it, DO NOT include that contact
-
-EXAMPLES OF INTELLIGENT MATCHING:
-- "Head of School" -> MATCHES (Principal variant)
-- "Superintendant" -> MATCHES (Superintendent, misspelling handled)
-- "IT Assistant" -> MATCHES (IT role, assistant is OK)
-- "Director of Information Technology" -> MATCHES (IT Director variant)
-- "Facilities Manager" -> MATCHES (Target role)
-- "Athletic Director" -> EXCLUDE (Exclusion role)
-- "Varsity Head Coach" -> EXCLUDE (Coach, exclusion role)
-- "High School Math Teacher" -> EXCLUDE (Teacher, not admin)
-- "IT Director" -> MATCHES (Target role)
-- "Principal" -> MATCHES (Target role)
-
-Example output format (use REAL names and emails from the page, not these examples):
-[
-  {{"name": "Actual Name From Page", "title": "Principal", "email": "real.email@school.edu", "phone": "555-123-4567"}},
-  {{"name": "Another Real Name", "title": "IT Director", "email": "another.real@school.edu", "phone": ""}}
-]
-
-Website text:
-{html_text}
-
-FINAL CHECKLIST - Before including any contact, verify:
-1. Name is visible on the page (not generic text, not placeholder)
-2. Title is visible on the page (near the name, on same line or adjacent)
-3. Email is OPTIONAL - if visible, it must be near the name (on same line or adjacent), otherwise use empty string ""
-4. Name and title appear together in the same area (email is OPTIONAL)
-5. Title matches TARGET ROLES (using intelligent matching)
-6. Title does NOT match EXCLUSION ROLES
-7. You did NOT guess, infer, or create any of the data
-
-Return ONLY the JSON array with contacts that meet the above criteria.
-Extract contacts matching TARGET ROLES even if they don't have visible emails - use empty string "" for email."""
+        # Find all split points with context
+        split_points = []
+        for delimiter in block_delimiters:
+            pattern = re.compile(re.escape(delimiter), re.IGNORECASE)
+            for match in pattern.finditer(html):
+                # Check context around delimiter for contact indicators
+                context_start = max(0, match.start() - 200)
+                context_end = min(len(html), match.end() + 200)
+                context = html[context_start:context_end].lower()
+                
+                # Prefer splitting after contact-like structures
+                # Look for patterns like name + email or title
+                has_contact_pattern = (
+                    '@' in context or  # Email present
+                    re.search(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', context) or  # Name pattern
+                    any(kw in context for kw in ['principal', 'director', 'administrator', 'email', 'phone'])
+                )
+                
+                split_points.append((match.end(), delimiter, has_contact_pattern))
         
-        return prompt
+        # Sort by position
+        split_points.sort(key=lambda x: x[0])
+        
+        # Build chunks with smart boundary detection
+        current_chunk = ""
+        last_split = 0
+        target_size = max_chunk_size - 5000  # Leave 5k buffer to avoid splitting mid-contact
+        
+        for split_pos, delimiter, is_contact_boundary in split_points:
+            segment = html[last_split:split_pos]
+            
+            # If adding segment would exceed target, check if we should split
+            if len(current_chunk) + len(segment) > target_size and current_chunk:
+                # If this is a contact boundary, it's safe to split here
+                if is_contact_boundary:
+                    chunks.append(current_chunk)
+                    current_chunk = segment
+                    last_split = split_pos
+                # Otherwise, try to find next contact boundary
+                elif len(current_chunk) < max_chunk_size * 0.8:  # Still room to grow
+                    current_chunk += segment
+                else:
+                    # Force split to avoid exceeding max
+                    chunks.append(current_chunk)
+                    current_chunk = segment
+                    last_split = split_pos
+            else:
+                current_chunk += segment
+                last_split = split_pos
+        
+        # Add remaining content
+        if current_chunk:
+            remaining = html[last_split:]
+            if len(current_chunk) + len(remaining) <= max_chunk_size:
+                current_chunk += remaining
+                chunks.append(current_chunk)
+            else:
+                # Split remaining intelligently
+                if current_chunk:
+                    chunks.append(current_chunk)
+                # Chunk remaining content
+                if len(remaining) > max_chunk_size:
+                    # Recursively chunk remaining
+                    remaining_chunks = self.chunk_html(remaining, max_chunk_size)
+                    chunks.extend(remaining_chunks)
+                else:
+                    chunks.append(remaining)
+        
+        # If no good split points found, split at safe boundaries
+        if not chunks:
+            # Try to split at paragraph or line breaks first
+            safe_splits = re.finditer(r'</p>|</br>|</h[1-6]>', html, re.IGNORECASE)
+            split_positions = [m.end() for m in safe_splits]
+            
+            if split_positions:
+                last_pos = 0
+                for pos in split_positions:
+                    if pos - last_pos > max_chunk_size:
+                        chunks.append(html[last_pos:pos])
+                        last_pos = pos
+                if last_pos < len(html):
+                    chunks.append(html[last_pos:])
+            else:
+                # Last resort: split at max_chunk_size but try to avoid mid-word
+                for i in range(0, len(html), max_chunk_size):
+                    chunk = html[i:i + max_chunk_size]
+                    # Try to end at a space or tag boundary
+                    if i + max_chunk_size < len(html):
+                        # Look for safe break point near end
+                        for j in range(len(chunk) - 1, max(0, len(chunk) - 100), -1):
+                            if chunk[j] in ['>', '\n', ' ']:
+                                chunk = html[i:i+j+1]
+                                i = i + j + 1
+                                break
+                    chunks.append(chunk)
+        
+        # Ensure no chunk exceeds max (safety check)
+        final_chunks = []
+        for chunk in chunks:
+            if len(chunk) > max_chunk_size:
+                # Split oversized chunk
+                for i in range(0, len(chunk), max_chunk_size):
+                    final_chunks.append(chunk[i:i + max_chunk_size])
+            else:
+                final_chunks.append(chunk)
+        
+        return final_chunks if final_chunks else [html]
     
-    def parse_with_llm(self, html_text: str, school_name: str, max_retries: int = 3) -> List[Dict]:
+    def parse_csv_response(self, csv_text: str) -> List[Dict]:
         """
-        Send HTML text to LLM and parse response
+        Parse CSV response from LLM into list of contact dictionaries
         
+        Args:
+            csv_text: CSV text from LLM
+            
+        Returns:
+            List of contact dictionaries
+        """
+        contacts = []
+        
+        # Clean up response (remove markdown code blocks if present)
+        csv_text = re.sub(r'^```csv\s*', '', csv_text, flags=re.MULTILINE)
+        csv_text = re.sub(r'^```\s*', '', csv_text, flags=re.MULTILINE)
+        csv_text = re.sub(r'\s*```$', '', csv_text, flags=re.MULTILINE)
+        csv_text = csv_text.strip()
+        
+        # Parse CSV
+        try:
+            reader = csv.DictReader(io.StringIO(csv_text))
+            for row in reader:
+                # Convert CSV row to contact dict
+                contact = {
+                    'name': f"{row.get('First Name', '').strip()} {row.get('Last Name', '').strip()}".strip(),
+                    'title': row.get('Title', '').strip(),
+                    'email': row.get('Email', '').strip(),
+                    'phone': row.get('Phone', '').strip()
+                }
+                
+                # Only add if has name and title (email is optional)
+                if contact['name'] and contact['title']:
+                    contacts.append(contact)
+        except Exception as e:
+            print(f"      WARNING: CSV parse error: {e}")
+            print(f"      CSV preview: {csv_text[:500]}")
+        
+        return contacts
+    
+    def deduplicate_contacts(self, contacts: List[Dict]) -> List[Dict]:
+        """
+        Deduplicate contacts by email (or name+domain if no email)
+        Keep the most complete version
+        
+        Args:
+            contacts: List of contact dictionaries
+            
+        Returns:
+            Deduplicated list
+        """
+        seen = {}
+        
+        for contact in contacts:
+            email = contact.get('email', '').strip().lower()
+            name = contact.get('name', '').strip().lower()
+            
+            # Primary key: email if present
+            if email:
+                key = email
+            else:
+                # Fallback: name + domain (if email domain is present in other fields)
+                domain = ''
+                if 'source_url' in contact:
+                    # Extract domain from URL
+                    url = contact['source_url']
+                    match = re.search(r'https?://([^/]+)', url)
+                    if match:
+                        domain = match.group(1)
+                key = f"{name}|{domain}"
+            
+            # If we've seen this key before, keep the more complete version
+            if key in seen:
+                existing = seen[key]
+                # Count non-empty fields
+                existing_fields = sum(1 for v in existing.values() if v and str(v).strip())
+                new_fields = sum(1 for v in contact.values() if v and str(v).strip())
+                
+                # Keep the one with more fields, or longer title if equal
+                if new_fields > existing_fields:
+                    seen[key] = contact
+                elif new_fields == existing_fields:
+                    if len(contact.get('title', '')) > len(existing.get('title', '')):
+                        seen[key] = contact
+            else:
+                seen[key] = contact
+        
+        return list(seen.values())
+    
+    def parse_with_llm(self, html_chunk: str, school_name: str, url: str, max_retries: int = 3) -> List[Dict]:
+        """
+        Send HTML chunk to LLM and parse CSV response
+        
+        Args:
+            html_chunk: HTML chunk to parse
+            school_name: School name (metadata)
+            url: Page URL (metadata)
+            max_retries: Maximum retry attempts
+            
         Returns:
             List of contact dictionaries
         """
         for attempt in range(max_retries):
             try:
-                prompt = self.create_parsing_prompt(html_text, school_name)
+                # Build user message with metadata and HTML chunk only
+                # The full prompt is in the system message (sent once per session, not per chunk)
+                user_message = f"""SCHOOL NAME: {school_name}
+PAGE URL: {url}
+
+HTML CONTENT:
+{html_chunk}"""
                 
-                # Use new OpenAI client API
-                # GPT-4o-mini supports 128k tokens for output - use generous limits
-                # Estimate tokens: ~4 characters per token
-                estimated_input_tokens = len(html_text) // 4
-                estimated_contacts = html_text.count('@')  # Rough estimate
+                # Estimate tokens for max_tokens calculation
+                estimated_input_tokens = len(html_chunk) // 4
                 
-                # Set max_tokens very high to ensure nothing is truncated
-                # Allow up to 32k tokens for response (well within 128k limit)
-                if estimated_contacts > 50 or estimated_input_tokens > 10000:
-                    max_tokens = 32000  # Very large pages - maximum response size
-                elif estimated_contacts > 20 or estimated_input_tokens > 5000:
-                    max_tokens = 16000  # Large pages
+                # Safety check: if chunk is still too large, it should have been split earlier
+                # But as a final safeguard, we'll note it (shouldn't happen with improved chunking)
+                if len(html_chunk) > 100000:
+                    print(f"      WARNING: HTML chunk still too large ({len(html_chunk):,} chars) - this should have been split earlier!")
+                    # Don't truncate - this indicates a bug in chunking logic
+                    # Process it anyway but log the issue
+                
+                # Set max_tokens based on input size
+                if estimated_input_tokens > 20000:
+                    max_tokens = 32000
+                elif estimated_input_tokens > 10000:
+                    max_tokens = 16000
                 else:
-                    max_tokens = 8000  # Normal pages - still generous
+                    max_tokens = 8000
                 
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": "You are a data extraction assistant. Return only valid JSON. Match names to their correct titles."},
-                        {"role": "user", "content": prompt}
+                        {"role": "system", "content": ADMIN_CONTACT_EXTRACTION_PROMPT},
+                        {"role": "user", "content": user_message}
                     ],
-                    temperature=0.0,  # Zero temperature for maximum accuracy, no creativity
+                    temperature=0.0,
                     max_tokens=max_tokens
                 )
                 
                 # Extract response text
                 response_text = response.choices[0].message.content.strip()
                 
-                # Clean up response (remove markdown code blocks if present)
-                response_text = re.sub(r'^```json\s*', '', response_text)
-                response_text = re.sub(r'^```\s*', '', response_text)
-                response_text = re.sub(r'\s*```$', '', response_text)
+                # Parse CSV response
+                contacts = self.parse_csv_response(response_text)
                 
-                # Parse JSON
-                contacts = json.loads(response_text)
+                return contacts
                 
-                # Validate structure
-                if not isinstance(contacts, list):
-                    print(f"      WARNING: Response not a list: {type(contacts)}")
-                    return []
-                
-                # Validate contacts (only email/name validation, NO title filtering)
-                valid_contacts = []
-                invalid_count = 0
-                for contact in contacts:
-                    if self._is_valid_contact(contact):
-                        valid_contacts.append(contact)
-                    else:
-                        invalid_count += 1
-                
-                if invalid_count > 0:
-                    print(f"      (Removed {invalid_count} contacts - missing name, title, or email)")
-                
-                return valid_contacts
-                
-            except json.JSONDecodeError as e:
-                if attempt < max_retries - 1:
-                    print(f"      WARNING: JSON parse error (attempt {attempt + 1}/{max_retries}), retrying...")
-                    time.sleep(2)
-                    continue
-                print(f"      ERROR: JSON parse error: {e}")
-                print(f"      Response length: {len(response_text)} chars")
-                print(f"      Response preview: {response_text[:300]}")
-                
-                # Try to recover partial JSON (improved recovery)
-                try:
-                    # Strategy 1: Find last complete array closing bracket
-                    last_complete = response_text.rfind(']')
-                    if last_complete > 0:
-                        partial_json = response_text[:last_complete + 1]
-                        # Try to find and close any incomplete objects
-                        open_braces = partial_json.count('{')
-                        close_braces = partial_json.count('}')
-                        if open_braces > close_braces:
-                            # Add missing closing braces
-                            partial_json += '}' * (open_braces - close_braces)
-                        try:
-                            contacts = json.loads(partial_json)
-                            if isinstance(contacts, list) and len(contacts) > 0:
-                                print(f"      WARNING: Recovered {len(contacts)} contacts from partial JSON")
-                                # Validate (only email/name, NO title filtering)
-                                valid_contacts = [c for c in contacts if self._is_valid_contact(c)]
-                                if valid_contacts:
-                                    return valid_contacts
-                        except:
-                            pass
-                    
-                    # Strategy 2: Extract individual complete JSON objects
-                    # Find all complete { ... } objects
-                    object_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
-                    matches = re.findall(object_pattern, response_text)
-                    if matches:
-                        recovered_contacts = []
-                        for match in matches:
-                            try:
-                                obj = json.loads(match)
-                                if isinstance(obj, dict) and 'name' in obj and 'email' in obj:
-                                    recovered_contacts.append(obj)
-                            except:
-                                continue
-                        if recovered_contacts:
-                            print(f"      WARNING: Recovered {len(recovered_contacts)} contacts from individual objects")
-                            # Validate (only email/name, NO title filtering)
-                            valid_contacts = [c for c in recovered_contacts if self._is_valid_contact(c)]
-                            if valid_contacts:
-                                return valid_contacts
-                except Exception as recovery_error:
-                    pass  # Recovery failed, return empty
-                
-                return []
             except Exception as e:
                 if attempt < max_retries - 1:
                     print(f"      WARNING: LLM error (attempt {attempt + 1}/{max_retries}): {e}, retrying...")
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                    time.sleep(2 ** attempt)
                     continue
                 print(f"      ERROR: LLM error: {e}")
                 return []
         
-        return []  # All retries failed
-    
-    def _similarity(self, a: str, b: str) -> float:
-        """
-        Calculate similarity ratio between two strings (0.0 to 1.0)
-        Uses SequenceMatcher for fuzzy matching
-        """
-        return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
-    
-    def _matches_target_title(self, title: str, threshold: float = 0.7) -> bool:
-        """
-        Check if title matches any target title using fuzzy matching
-        EXCLUDES titles not relevant to security grants (athletic, academic dean, etc.)
-        
-        Uses multiple strategies:
-        1. Exclusion check (filter out non-relevant titles first)
-        2. Exact substring match (fastest)
-        3. Fuzzy similarity matching (70% similarity)
-        4. Keyword-based matching for variations
-        
-        Args:
-            title: Contact's title to check
-            threshold: Similarity threshold (0.0 to 1.0), default 0.7 (70% similar)
-        
-        Returns:
-            True if title matches any target title (fuzzy) AND is not excluded
-        """
-        if not title:
-            return False
-        
-        title_lower = title.lower().strip()
-        
-        # EXCLUSION CHECK: Filter out non-relevant titles first
-        # These are NOT decision-makers for security grants
-        for exclude in self.exclude_titles:
-            exclude_lower = exclude.lower()
-            # Check exact match or if excluded title is in the title
-            if exclude_lower == title_lower or exclude_lower in title_lower or title_lower in exclude_lower:
-                return False
-            # Fuzzy match for exclusions (catch variations)
-            similarity = self._similarity(title, exclude)
-            if similarity >= 0.8:  # High threshold for exclusions (avoid false positives)
-                return False
-        
-        # Strategy 1: Exact substring match (fastest)
-        # Check if any target title is contained in the title or vice versa
-        # Handle comma-separated titles (e.g., "Head of School, Principal")
-        title_parts = [part.strip() for part in title_lower.split(',')]
-        for target in self.target_titles:
-            target_lower = target.lower()
-            # Check if target matches any part of the title (handles comma-separated)
-            for part in title_parts:
-                if target_lower in part or part in target_lower:
-                    return True
-            # Also check full title match
-            if target_lower in title_lower or title_lower in target_lower:
-                return True
-        
-        # Strategy 2: Fuzzy similarity matching for variations
-        # Catches slight differences like "Superintendent" vs "Superintendant"
-        for target in self.target_titles:
-            similarity = self._similarity(title, target)
-            if similarity >= threshold:
-                return True
-        
-        # Strategy 3: Keyword-based matching for complex titles
-        # (e.g., "Director of Information Technology" should match "IT Director")
-        # Extract key words from title
-        title_words = set(re.findall(r'\b\w+\b', title_lower))
-        
-        # Check if title contains multiple relevant keywords
-        principal_keywords = ['principal', 'superintendent', 'superintendant', 'headmaster', 
-                             'head', 'administrator', 'director', 'school']
-        it_keywords = ['it', 'technology', 'tech', 'cto', 'information', 'computer', 'systems']
-        facilities_keywords = ['facilities', 'facility', 'maintenance', 'building', 'operations']
-        security_keywords = ['security', 'safety', 'protection']
-        operations_keywords = ['operations', 'finance', 'business', 'financial']
-        
-        # Principal/admin matching (BUT exclude "dean" unless it's operational)
-        if any(kw in title_lower for kw in principal_keywords[:4]):  # principal, superintendent, headmaster, head
-            # Skip if it's an academic dean
-            if 'academic dean' in title_lower or 'dean of students' in title_lower:
-                # Only include if it's clearly operational (dean of students might be relevant)
-                if 'dean of students' not in title_lower:
-                    return False
-            if any(kw in title_lower for kw in ['principal', 'superintendent', 'headmaster', 'head of school', 
-                                                 'director', 'administrator', 'school']):
-                return True
-        
-        # IT matching
-        if any(kw in title_lower for kw in it_keywords[:3]):  # it, technology, tech
-            if 'director' in title_lower or 'manager' in title_lower or 'officer' in title_lower:
-                return True
-        
-        # Facilities matching
-        if any(kw in title_lower for kw in facilities_keywords):
-            if 'director' in title_lower or 'manager' in title_lower:
-                return True
-        
-        # Security matching
-        if any(kw in title_lower for kw in security_keywords):
-            if 'director' in title_lower or 'manager' in title_lower or 'officer' in title_lower:
-                return True
-        
-        # Operations/Finance matching (budget decision makers)
-        if any(kw in title_lower for kw in operations_keywords):
-            if 'director' in title_lower or 'manager' in title_lower or 'officer' in title_lower:
-                return True
-        
-        return False
-    
-    def _is_valid_contact(self, contact: Dict) -> bool:
-        """
-        Validate contact - check that name and title exist (email is optional)
-        NO email format validation - let GPT prompt handle what's valid
-        NO title filtering - extract all contacts the LLM finds
-        """
-        required_fields = ['name', 'title']
-
-        # Check required fields exist
-        if not all(field in contact for field in required_fields):
-            return False
-
-        # Check name and title are non-empty (email is optional)
-        if not contact.get('name') or not contact.get('title'):
-            return False
-
-        # Email is optional - can be empty string "" for contacts without visible emails
-        # NO EMAIL FORMAT VALIDATION - GPT prompt handles what's valid
-        # NO TITLE FILTERING - accept all contacts with name and title
-        return True
+        return []
     
     def parse_pages(self, input_csv: str, output_csv: str, output_no_emails_csv: str = None):
         """
-        Parse all pages from Step 3 using LLM
+        Parse all pages from Step 3 using LLM with HTML reduction and chunking
         
         Args:
             input_csv: CSV from Step 3 with HTML content
@@ -568,15 +654,16 @@ Extract contacts matching TARGET ROLES even if they don't have visible emails - 
             output_no_emails_csv: Output CSV with parsed contacts WITHOUT emails (for enrichment)
         """
         print("\n" + "="*70)
-        print("STEP 4: PARSING HTML WITH LLM")
+        print("STEP 4: PARSING HTML WITH LLM (NO FILTERING - LLM ONLY)")
         print("="*70)
         print(f"Model: {self.model}")
+        print("Processing ALL pages (including those without emails)")
+        print("="*70 + "\n")
         
         # Read crawled pages
         df = pd.read_csv(input_csv)
         
-        # Step 3 outputs: school_name, url, html_content, fetch_method, email_count, has_emails
-        # Filter to pages with content (process ALL pages with HTML)
+        # Process ALL pages with HTML content (NO has_emails filter)
         df_success = df[df['html_content'].notna() & (df['html_content'] != '')].copy()
         
         print(f"Processing {len(df_success)} pages")
@@ -595,47 +682,66 @@ Extract contacts matching TARGET ROLES even if they don't have visible emails - 
             print(f"\n[{idx + 1}/{len(df_success)}] {school_name}")
             print(f"  URL: {url[:60]}...")
             
-            # Extract text from HTML
-            html_text = self.extract_text_from_html(html_content)
+            # Step 1: Reduce HTML to people sections only
+            reduced_html = self.reduce_html(html_content)
             
-            if not html_text:
-                print(f"    WARNING: No text extracted")
+            if not reduced_html:
+                print(f"    No people sections found, skipping")
                 continue
             
-            print(f"    Extracted {len(html_text)} chars of text")
-            print(f"    Sending to {self.model}...")
+            print(f"    Reduced HTML: {len(html_content)} → {len(reduced_html)} chars")
             
-            # Parse with LLM
-            contacts = self.parse_with_llm(html_text, school_name)
+            # Step 2: Chunk HTML if needed (ensures all content is processed, no truncation)
+            # If reduced HTML is very large, chunk it properly instead of truncating
+            chunks = self.chunk_html(reduced_html, max_chunk_size=40000)
             
-            pages_processed += 1
+            # Safety check: if any chunk is still too large, split it further
+            final_chunks = []
+            for chunk in chunks:
+                if len(chunk) > 100000:  # Hard limit per chunk
+                    print(f"      WARNING: Chunk too large ({len(chunk):,} chars), splitting further...")
+                    # Split oversized chunk into smaller pieces
+                    sub_chunks = self.chunk_html(chunk, max_chunk_size=40000)
+                    final_chunks.extend(sub_chunks)
+                else:
+                    final_chunks.append(chunk)
+            chunks = final_chunks
+            print(f"    Split into {len(chunks)} chunk(s)")
             
-            if contacts:
-                pages_with_contacts += 1
-                total_contacts += len(contacts)
-                print(f"    Found {len(contacts)} contacts")
+            # Step 3: Process each chunk
+            page_contacts = []
+            for chunk_idx, chunk in enumerate(chunks):
+                if len(chunks) > 1:
+                    print(f"    Processing chunk {chunk_idx + 1}/{len(chunks)}...")
                 
-                # Add school and URL to each contact
-                for contact in contacts:
+                chunk_contacts = self.parse_with_llm(chunk, school_name, url)
+                page_contacts.extend(chunk_contacts)
+                
+                # Rate limiting between chunks
+                if chunk_idx < len(chunks) - 1:
+                    time.sleep(0.5)
+            
+            # Step 4: Deduplicate contacts from all chunks for this page
+            if page_contacts:
+                # Add school and URL metadata
+                for contact in page_contacts:
                     contact['school_name'] = school_name
                     contact['source_url'] = url
-                    all_contacts.append(contact)
+                
+                # Deduplicate
+                page_contacts = self.deduplicate_contacts(page_contacts)
+                
+                pages_with_contacts += 1
+                total_contacts += len(page_contacts)
+                print(f"    Found {len(page_contacts)} contacts (after deduplication)")
+                
+                all_contacts.extend(page_contacts)
             else:
                 print(f"    - No valid contacts found")
             
-            # Save progress every 10 pages (temporary - will split at end)
-            if pages_processed % 10 == 0:
-                # Temporarily save all contacts together
-                temp_contacts_with = [c for c in all_contacts if c.get('email', '').strip()]
-                temp_contacts_without = [c for c in all_contacts if not c.get('email', '').strip()]
-                if temp_contacts_with:
-                    self._save_results(temp_contacts_with, output_csv)
-                if output_no_emails_csv and temp_contacts_without:
-                    self._save_results(temp_contacts_without, output_no_emails_csv)
-                print(f"\n  Progress saved: {total_contacts} contacts from {pages_processed} pages")
+            pages_processed += 1
             
-            # Minimal rate limiting - GPT-4o-mini has high rate limits
-            # Only small delay to avoid overwhelming the API
+            # Rate limiting between pages
             time.sleep(0.5)
         
         # Split contacts into two groups: with emails and without emails
@@ -652,10 +758,17 @@ Extract contacts matching TARGET ROLES even if they don't have visible emails - 
         # Save contacts with emails
         if contacts_with_emails:
             self._save_results(contacts_with_emails, output_csv)
+        else:
+            # Create empty CSV with headers
+            pd.DataFrame(columns=['school_name', 'name', 'title', 'email', 'phone', 'source_url']).to_csv(output_csv, index=False)
         
         # Save contacts without emails (for enrichment)
-        if output_no_emails_csv and contacts_without_emails:
-            self._save_results(contacts_without_emails, output_no_emails_csv)
+        if output_no_emails_csv:
+            if contacts_without_emails:
+                self._save_results(contacts_without_emails, output_no_emails_csv)
+            else:
+                # Create empty CSV with headers
+                pd.DataFrame(columns=['school_name', 'name', 'title', 'email', 'phone', 'source_url']).to_csv(output_no_emails_csv, index=False)
         
         # Print summary
         self._print_summary(all_contacts, output_csv, pages_processed, pages_with_contacts, 
@@ -670,6 +783,8 @@ Extract contacts matching TARGET ROLES even if they don't have visible emails - 
         
         # Reorder columns
         column_order = ['school_name', 'name', 'title', 'email', 'phone', 'source_url']
+        # Only include columns that exist
+        column_order = [col for col in column_order if col in df.columns]
         df = df[column_order]
         
         df.to_csv(filename, index=False)
@@ -679,39 +794,41 @@ Extract contacts matching TARGET ROLES even if they don't have visible emails - 
                        contacts_with_emails: List[Dict], contacts_without_emails: List[Dict],
                        output_no_emails_csv: str = None):
         """Print parsing summary"""
-        if not contacts:
-            print("\nERROR: No contacts extracted")
-            return
-        
-        df = pd.DataFrame(contacts)
-        
         print("\n" + "="*70)
         print("PARSING COMPLETE")
         print("="*70)
         print(f"Pages processed: {pages_processed}")
-        print(f"Pages with contacts: {pages_with_contacts} ({pages_with_contacts/pages_processed*100:.1f}%)")
-        print(f"Total contacts extracted: {len(df)}")
+        print(f"Pages with contacts: {pages_with_contacts} ({pages_with_contacts/max(1, pages_processed)*100:.1f}%)")
+        print(f"Total contacts extracted: {len(contacts)}")
         print(f"  - Contacts WITH emails: {len(contacts_with_emails)}")
         print(f"  - Contacts WITHOUT emails: {len(contacts_without_emails)}")
-        print(f"Unique schools: {df['school_name'].nunique()}")
-        print(f"\nAverage contacts per page: {len(df)/pages_processed:.2f}")
-        print(f"Contacts with phone numbers: {df['phone'].ne('').sum()} ({df['phone'].ne('').sum()/len(df)*100:.1f}%)")
+        
+        if contacts:
+            df = pd.DataFrame(contacts)
+            print(f"Unique schools: {df['school_name'].nunique()}")
+            print(f"\nAverage contacts per page: {len(df)/max(1, pages_processed):.2f}")
+            print(f"Contacts with phone numbers: {df['phone'].ne('').sum()} ({df['phone'].ne('').sum()/len(df)*100:.1f}%)")
+            
+            # Show top schools
+            print("\nTop 10 schools by contacts found:")
+            top_schools = df.groupby('school_name').size().sort_values(ascending=False).head(10)
+            for school, count in top_schools.items():
+                print(f"  {school[:40]:40} | {count} contacts")
+            
+            # Show title distribution
+            print("\nTitle distribution:")
+            title_counts = df['title'].value_counts().head(10)
+            for title, count in title_counts.items():
+                print(f"  {title[:40]:40} | {count}")
+        else:
+            print("Unique schools: 0")
+            print("\nAverage contacts per page: 0.00")
+            print("Contacts with phone numbers: 0 (0.0%)")
+        
         print(f"\nOutput file (with emails): {output_file}")
         if output_no_emails_csv:
             print(f"Output file (without emails, for enrichment): {output_no_emails_csv}")
         print("="*70)
-        
-        # Show top schools
-        print("\nTop 10 schools by contacts found:")
-        top_schools = df.groupby('school_name').size().sort_values(ascending=False).head(10)
-        for school, count in top_schools.items():
-            print(f"  {school[:40]:40} | {count} contacts")
-        
-        # Show title distribution
-        print("\nTitle distribution:")
-        title_counts = df['title'].value_counts().head(10)
-        for title, count in title_counts.items():
-            print(f"  {title[:40]:40} | {count}")
 
 
 if __name__ == "__main__":

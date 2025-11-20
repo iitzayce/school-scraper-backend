@@ -159,7 +159,8 @@ class ContentCollector:
                 for selector in clickable_selectors:
                     try:
                         elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                        for element in elements[:10]:  # Limit to first 10 to avoid too many clicks
+                        # Increased to 75 clicks per selector type to handle large staff directories
+                        for element in elements[:75]:
                             try:
                                 # Scroll element into view
                                 self.driver.execute_script("arguments[0].scrollIntoView(true);", element)
@@ -251,12 +252,34 @@ class ContentCollector:
                 html = response.text
                 fetch_method = 'requests'
                 
-                # Quick check: if no emails found in simple HTML, try Selenium
+                # Check for emails and staff indicators
                 emails = self.extract_emails(html)
-                if not emails or len(emails) == 0:
-                    print(f"    WARNING: No emails in HTML, trying Selenium (click/hover reveals)...")
+                soup = BeautifulSoup(html, 'html.parser')
+                text_lower = soup.get_text().lower()
+                
+                # Check for high-value titles/names that indicate staff pages
+                high_value_keywords = [
+                    'principal', 'superintendent', 'head of school', 'director',
+                    'administrator', 'dean', 'assistant principal', 'vice principal'
+                ]
+                has_high_value_titles = any(keyword in text_lower for keyword in high_value_keywords)
+                
+                # Check for name patterns (likely person names)
+                name_pattern = re.search(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', soup.get_text())
+                has_name_pattern = bool(name_pattern)
+                
+                # Use Selenium if:
+                # 1. No emails found, OR
+                # 2. Has high-value titles/names (even if emails found - might be more in Selenium)
+                should_use_selenium = (not emails or len(emails) == 0) or (has_high_value_titles and has_name_pattern)
+                
+                if should_use_selenium:
+                    if not emails or len(emails) == 0:
+                        print(f"    No emails in HTML, trying Selenium (click/hover reveals)...")
+                    else:
+                        print(f"    Found {len(emails)} emails + high-value titles detected, using Selenium for comprehensive extraction...")
                     
-                    # TIER 2: Fallback to Selenium
+                    # TIER 2: Use Selenium for better extraction
                     if self.use_selenium:
                         html_selenium = self.fetch_with_selenium(url, interact=True)
                         if html_selenium:
@@ -264,9 +287,10 @@ class ContentCollector:
                             fetch_method = 'selenium'
                             
                             # Re-check emails after Selenium
-                            emails = self.extract_emails(html)
-                            if emails:
-                                print(f"    Found {len(emails)} emails via Selenium")
+                            emails_after = self.extract_emails(html)
+                            if emails_after:
+                                print(f"    Found {len(emails_after)} emails via Selenium (was {len(emails) if emails else 0})")
+                                emails = emails_after
                 else:
                     print(f"    Found {len(emails)} emails via simple HTML")
             else:
