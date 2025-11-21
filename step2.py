@@ -243,8 +243,8 @@ class PageDiscoverer:
             if len(discovered_pages) >= max_pages_per_school:
                 break
             
-            # Skip zero-priority pages (contact, admissions) - already filtered in score_page_priority
-            if priority_estimate <= 0:
+            # Skip zero-priority pages (contact, admissions) - but allow homepage (depth 0)
+            if priority_estimate <= 0 and depth > 0:
                 continue
             
             visited.add(current_url)

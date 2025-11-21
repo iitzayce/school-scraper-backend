@@ -97,19 +97,7 @@ class SchoolSearcher:
                             self.seen_place_ids.add(place_id)
                             county_new_schools += 1
 
-                            # Filter out churches, camps, and non-school organizations
-                            name_lower = name
-                            exclude_keywords = ['church', 'camp', 'ministry', 'fellowship', 'worship center', 
-                                               'bible institute', 'seminary', 'mission', 'outreach center']
-                            
-                            # Skip if name contains exclusion keywords (unless it also clearly says "school")
-                            if any(keyword in name_lower for keyword in exclude_keywords):
-                                # Only include if it also has school-related keywords
-                                school_keywords = ['school', 'academy', 'preschool', 'elementary', 'high school']
-                                if not any(keyword in name_lower for keyword in school_keywords):
-                                    continue  # Skip churches/camps that aren't schools
-                            
-                            # Build school record
+                            # Build school record (no filtering - Step 1.5 handles filtering)
                             school = {
                                 'place_id': place_id,
                                 'name': place.get('displayName', {}).get('text', ''),
