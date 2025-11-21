@@ -72,7 +72,7 @@ export default function Home() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ batchSize: 50 }), // BATCH MODE: 50 counties, NO LIMITERS
+        body: JSON.stringify({ batchSize: 10 }), // BATCH MODE: 10 counties for Cloud Run test
       });
 
       if (!response.ok) {
@@ -121,13 +121,13 @@ export default function Home() {
 
   // START VIEW
   if (viewState === "start") {
-    return (
+  return (
       <div className="min-h-screen bg-black text-white flex items-center justify-center p-8">
         <div className="w-full max-w-6xl">
           <div className="bg-gray-900 rounded-lg border border-gray-800 p-8 shadow-xl">
             <h1 className="text-3xl font-bold text-center mb-8 text-white">
               School Contact Scraper
-            </h1>
+          </h1>
             
             <div className="flex flex-col items-center justify-center space-y-6">
               <p className="text-gray-400 text-center">
@@ -276,8 +276,8 @@ export default function Home() {
             </div>
           </div>
         </div>
-      </div>
-    );
+    </div>
+  );
   }
 
   return null;
