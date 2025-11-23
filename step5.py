@@ -126,7 +126,7 @@ class LLMParser:
             'technology', 'it', 'security', 'safety', 'emergency', 'facilities',
             'hr', 'human resources'
         ]
-        
+    
         # Remove header/footer/nav/aside ONLY if clearly unrelated to admin
         for tag_name in ['header', 'footer', 'nav', 'aside']:
             for element in soup.find_all(tag_name):
@@ -289,7 +289,7 @@ class LLMParser:
                 # Split oversized chunk
                 for i in range(0, len(chunk), max_chunk_size):
                     final_chunks.append(chunk[i:i + max_chunk_size])
-            else:
+        else:
                 final_chunks.append(chunk)
         
         return final_chunks if final_chunks else [html]
@@ -300,7 +300,7 @@ class LLMParser:
         
         Args:
             email: Raw email string (may contain special characters or invalid text)
-            
+        
         Returns:
             Cleaned email string, or empty string if invalid
         """

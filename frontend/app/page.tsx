@@ -124,7 +124,7 @@ export default function Home() {
 
   async function checkPipelineStatus(runId: string) {
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "https://school-scraper-200036585956.us-central1.run.app";
       const response = await fetch(`${apiUrl}/pipeline-status/${runId}`, {
         method: "GET",
         headers: {
@@ -166,9 +166,21 @@ export default function Home() {
         // Update progress
         setSummary(data);
         setCurrentStep(data.currentStep || 0);
-        setProgress(data.progress || 0);
+        
+        // Calculate progress based on counties processed
+        const countiesProcessed = data.countiesProcessed || 0;
+        const totalCounties = data.totalCounties || 1;
+        const countyProgress = Math.round((countiesProcessed / totalCounties) * 100);
+        setProgress(countyProgress);
+        
         setEstimatedTime(data.estimatedTimeRemaining || null);
-        setStatus(data.statusMessage || "Processing...");
+        
+        // Build status message with county info
+        let statusMsg = data.statusMessage || "Processing...";
+        if (data.currentCounty) {
+          statusMsg = `Processing ${data.currentCounty} County (${countiesProcessed + 1} of ${totalCounties})`;
+        }
+        setStatus(statusMsg);
       }
     } catch (err) {
       console.error("Status check error:", err);
@@ -198,11 +210,7 @@ export default function Home() {
     setEstimatedTime(null);
 
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
-
-      if (!apiUrl) {
-        throw new Error("API URL not configured. Please set NEXT_PUBLIC_API_URL in Vercel environment variables.");
-      }
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "https://school-scraper-200036585956.us-central1.run.app";
 
       const response = await fetch(`${apiUrl}/run-pipeline`, {
         method: "POST",
@@ -210,7 +218,7 @@ export default function Home() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ 
-          state: selectedState,
+          state: selectedState.toLowerCase().replace(' ', '_'),
           type: selectedType,
         }),
       });
@@ -297,7 +305,7 @@ export default function Home() {
 
   // START VIEW
   if (viewState === "start") {
-    return (
+  return (
       <div className="min-h-screen bg-black text-white flex items-center justify-center p-8">
         <div className="w-full max-w-2xl">
           <div className="bg-gray-900 rounded-lg border border-gray-800 p-8 shadow-xl">
@@ -453,7 +461,9 @@ export default function Home() {
               </div>
               <div className="flex justify-between items-center text-sm text-gray-400">
                 <span>{timeDisplay}</span>
-                <span>{summary?.currentStep || 0} / {summary?.totalSteps || 7} steps</span>
+                <span>
+                  {summary?.countiesProcessed || 0} / {summary?.totalCounties || 0} counties
+                </span>
               </div>
             </div>
 
@@ -464,25 +474,45 @@ export default function Home() {
 
             {/* Milestones */}
             <div className="space-y-2">
-              <h3 className="text-lg font-semibold mb-3 text-white">Milestones</h3>
-              {stepMessages.map((message, index) => (
-                <div
-                  key={index}
-                  className={`p-3 rounded-lg ${
-                    index < (summary?.steps?.length || 0)
-                      ? "bg-green-900/30 border border-green-800"
-                      : "bg-gray-800 border border-gray-700"
-                  }`}
-                >
-                  <p className={`text-sm ${
-                    index < (summary?.steps?.length || 0)
-                      ? "text-green-300"
-                      : "text-gray-400"
-                  }`}>
-                    {index < (summary?.steps?.length || 0) ? "✓" : "○"} {message}
+              <h3 className="text-lg font-semibold mb-3 text-white">Current Progress</h3>
+              
+              {/* County Progress */}
+              {summary?.totalCounties && (
+                <div className="p-3 rounded-lg bg-blue-900/30 border border-blue-800 mb-3">
+                  <p className="text-sm text-blue-300">
+                    <strong>Counties:</strong> {summary.countiesProcessed || 0} of {summary.totalCounties} processed
+                    {summary.currentCounty && (
+                      <span className="block mt-1">Currently processing: <strong>{summary.currentCounty}</strong></span>
+                    )}
                   </p>
                 </div>
-              ))}
+              )}
+              
+              {/* Step Progress */}
+              {summary?.steps && summary.steps.length > 0 && (
+                <div className="space-y-2">
+                  {summary.steps.map((step: StepSummary, index: number) => (
+                    <div
+                      key={index}
+                      className="p-3 rounded-lg bg-green-900/30 border border-green-800"
+                    >
+                      <p className="text-sm text-green-300">
+                        ✓ {step.name}
+                        {step.schoolsFound !== undefined && (
+                          <span className="block mt-1 text-xs text-green-400">
+                            {step.schoolsFound} schools found
+                          </span>
+                        )}
+                        {step.contactsWithEmails !== undefined && (
+                          <span className="block mt-1 text-xs text-green-400">
+                            {step.contactsWithEmails} contacts with emails, {step.contactsWithoutEmails || 0} without
+                          </span>
+                        )}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {error && (
@@ -526,22 +556,38 @@ export default function Home() {
 
             {/* Download Buttons */}
             <div className="flex flex-col space-y-4">
-              {summary.csvData && summary.csvFilename && (
+              {summary.csvData && summary.csvFilename ? (
                 <button
                   onClick={() => downloadCSV(summary.csvData!, summary.csvFilename!)}
                   className="w-full px-6 py-4 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition-colors"
                 >
                   Download Leads with Emails ({summary.totalContacts || 0} contacts)
                 </button>
+              ) : (
+                <div className="w-full px-6 py-4 bg-gray-800 border border-gray-700 rounded-lg text-center">
+                  <p className="text-gray-400 text-sm">No contacts with emails found</p>
+                </div>
               )}
               
-              {summary.csvNoEmailsData && summary.csvNoEmailsFilename && (
+              {summary.csvNoEmailsData && summary.csvNoEmailsFilename ? (
                 <button
                   onClick={() => downloadCSV(summary.csvNoEmailsData!, summary.csvNoEmailsFilename!)}
                   className="w-full px-6 py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
                 >
                   Download Leads without Emails ({summary.totalContactsNoEmails || 0} contacts)
                 </button>
+              ) : (
+                <div className="w-full px-6 py-4 bg-gray-800 border border-gray-700 rounded-lg text-center">
+                  <p className="text-gray-400 text-sm">No contacts without emails found</p>
+                </div>
+              )}
+              
+              {(!summary.csvData && !summary.csvNoEmailsData) && (
+                <div className="w-full px-6 py-4 bg-yellow-900/30 border border-yellow-800 rounded-lg text-center mb-4">
+                  <p className="text-yellow-300 text-sm">
+                    No contacts were found. This may be normal if no schools were discovered or no contacts were extracted.
+                  </p>
+                </div>
               )}
               
               <button
@@ -553,8 +599,8 @@ export default function Home() {
             </div>
           </div>
         </div>
-      </div>
-    );
+    </div>
+  );
   }
 
   return null;

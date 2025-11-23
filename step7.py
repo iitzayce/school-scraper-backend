@@ -371,7 +371,7 @@ class FinalCompiler:
         else:
             # Create combined name for validation
             df['name'] = (df['first_name'].fillna('') + ' ' + df['last_name'].fillna('')).str.strip()
-            df['name_valid'] = df['name'].apply(self.is_valid_name)
+        df['name_valid'] = df['name'].apply(self.is_valid_name)
         df = df[df['name_valid'] == True]
         print(f"  After name validation (removed generic text): {len(df)}")
         

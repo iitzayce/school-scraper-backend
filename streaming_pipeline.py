@@ -92,7 +92,7 @@ class StreamingPipeline:
         self._state = state
         
         # Initialize step processors
-        self.school_searcher = SchoolSearcher(google_api_key, global_max_api_calls)
+        self.school_searcher = SchoolSearcher(google_api_key, global_max_api_calls, target_state=state)
         self.page_discoverer = step3.PageDiscoverer(timeout=120, max_retries=5)
         self.content_collector = step4.ContentCollector(timeout=120, max_retries=5, use_selenium=True)
         self.llm_parser = step5.LLMParser(openai_api_key, model="gpt-4o-mini")
@@ -124,9 +124,9 @@ class StreamingPipeline:
         print(f"County: {school.county}")
         
         # Step 2: Filter school
-        filtered_school = filter_school(school)
+        filtered_school = filter_school(school, target_state=self._state)
         if not filtered_school:
-            print("  ❌ Filtered out (not a valid Texas school)")
+            print(f"  ❌ Filtered out (not a valid {self._state} school)")
             self.stats['schools_filtered_out'] += 1
             return []
         
@@ -375,7 +375,7 @@ class StreamingPipeline:
         if cities is not None and len(cities) > 0:
             school_generator = self.school_searcher.discover_schools_cities(
                 cities=cities,
-                state='Texas',
+                state=self._state or 'Texas',
                 num_cities=5  # 5 random cities, 1 API call each
             )
         else:

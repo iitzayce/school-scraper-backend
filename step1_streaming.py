@@ -19,9 +19,10 @@ from shared.models import School
 class SchoolSearcher:
     """Search for schools using Legacy Google Places API, yields School objects"""
     
-    def __init__(self, api_key: str, global_max_api_calls: int = None):
+    def __init__(self, api_key: str, global_max_api_calls: int = None, target_state: str = 'texas'):
         self.api_key = api_key
         self.global_max_api_calls = global_max_api_calls
+        self.target_state = target_state.lower().replace(' ', '_')
         # LEGACY Places API endpoint (cheaper than new API)
         self.base_url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
         self.seen_place_ids = set()
@@ -30,8 +31,29 @@ class SchoolSearcher:
             'total_api_calls': 0,
             'total_schools_found': 0,
             'schools_with_websites': 0,
-            'non_texas_skipped': 0
+            'non_state_skipped': 0
         }
+        
+        # State name to abbreviation mapping
+        self.STATE_ABBREVIATIONS = {
+            'alabama': 'AL', 'alaska': 'AK', 'arizona': 'AZ', 'arkansas': 'AR',
+            'california': 'CA', 'colorado': 'CO', 'connecticut': 'CT', 'delaware': 'DE',
+            'florida': 'FL', 'georgia': 'GA', 'hawaii': 'HI', 'idaho': 'ID',
+            'illinois': 'IL', 'indiana': 'IN', 'iowa': 'IA', 'kansas': 'KS',
+            'kentucky': 'KY', 'louisiana': 'LA', 'maine': 'ME', 'maryland': 'MD',
+            'massachusetts': 'MA', 'michigan': 'MI', 'minnesota': 'MN', 'mississippi': 'MS',
+            'missouri': 'MO', 'montana': 'MT', 'nebraska': 'NE', 'nevada': 'NV',
+            'new_hampshire': 'NH', 'new_jersey': 'NJ', 'new_mexico': 'NM', 'new_york': 'NY',
+            'north_carolina': 'NC', 'north_dakota': 'ND', 'ohio': 'OH', 'oklahoma': 'OK',
+            'oregon': 'OR', 'pennsylvania': 'PA', 'rhode_island': 'RI', 'south_carolina': 'SC',
+            'south_dakota': 'SD', 'tennessee': 'TN', 'texas': 'TX', 'utah': 'UT',
+            'vermont': 'VT', 'virginia': 'VA', 'washington': 'WA', 'west_virginia': 'WV',
+            'wisconsin': 'WI', 'wyoming': 'WY'
+        }
+        
+        # Get state info
+        self.state_abbrev = self.STATE_ABBREVIATIONS.get(self.target_state, '')
+        self.full_state_name = self.target_state.replace('_', ' ').title()
 
     def _hit_global_limit(self) -> bool:
         """Check if global API call limit has been reached"""
@@ -64,21 +86,30 @@ class SchoolSearcher:
         
         return state_value, county_value
 
-    def _is_texas_result(self, detected_state: str, formatted_address: str) -> bool:
-        """Determine if the result belongs to Texas"""
+    def _is_state_result(self, detected_state: str, formatted_address: str) -> bool:
+        """Determine if the result belongs to the target state"""
         if detected_state:
             normalized_state = detected_state.strip().lower()
-            if normalized_state in ('tx', 'texas'):
+            # Check against abbreviation, normalized name, or full name
+            if normalized_state == self.state_abbrev.lower() or normalized_state == self.target_state or normalized_state == self.full_state_name.lower():
                 return True
 
         address_upper = (formatted_address or '').upper()
-        if ', TX ' in address_upper or address_upper.endswith(', TX') or ' TEXAS' in address_upper:
+        
+        # Check for state abbreviation in address
+        if self.state_abbrev:
+            if f', {self.state_abbrev} ' in address_upper or address_upper.endswith(f', {self.state_abbrev}'):
+                return True
+        
+        # Check for full state name in address
+        if f' {self.full_state_name.upper()}' in address_upper:
             return True
 
         # Last fallback: look for state abbreviation pattern
-        match = re.search(r',\s*([A-Z]{2})\s+\d{5}', formatted_address or '')
-        if match and match.group(1) == 'TX':
-            return True
+        if self.state_abbrev:
+            match = re.search(r',\s*([A-Z]{2})\s+\d{5}', formatted_address or '')
+            if match and match.group(1) == self.state_abbrev:
+                return True
 
         return False
 
@@ -99,10 +130,10 @@ class SchoolSearcher:
         # Extract state and county from legacy format
         detected_state, detected_county = self._extract_state_and_county_legacy(result)
         
-        # Validate Texas-only
+        # Validate state-only
         formatted_address = result.get('formatted_address', '')
-        if not self._is_texas_result(detected_state, formatted_address):
-            self.stats['non_texas_skipped'] += 1
+        if not self._is_state_result(detected_state, formatted_address):
+            self.stats['non_state_skipped'] += 1
             return None
         
         # Extract website and phone
@@ -152,7 +183,7 @@ class SchoolSearcher:
             types=', '.join(result.get('types', [])),
             business_status=result.get('business_status'),
             county=(detected_county or location).replace('County', '').strip(),
-            state='Texas',
+            state=self.full_state_name,
             detected_state=detected_state or '',
             detected_county=detected_county or '',
             found_via=search_term.split(' in ')[0] if ' in ' in search_term else search_term
@@ -168,13 +199,16 @@ class SchoolSearcher:
     def search_city(
         self,
         city: str,
-        state: str = 'Texas'
+        state: str = None
     ) -> Iterator[School]:
         """
         Search for Christian schools in a specific city.
         YIELDS School objects one at a time (generator).
         Uses ONE API call per city (hard cap).
         """
+        # Use target_state if state not provided
+        if state is None:
+            state = self.full_state_name
         # Single search term per city (1 API call max)
         query = f"Christian schools in {city}, {state}"
         
@@ -237,13 +271,16 @@ class SchoolSearcher:
     def search_county(
         self,
         county: str,
-        state: str = 'Texas',
+        state: str = None,
         max_search_terms: int = None
     ) -> Iterator[School]:
         """
         Search for Christian schools in a specific county.
         YIELDS School objects one at a time (generator).
         """
+        # Use target_state if state not provided
+        if state is None:
+            state = self.full_state_name
         # Define search terms for Christian schools
         search_terms = [
             f"Christian schools in {county} County, {state}",
@@ -348,7 +385,7 @@ class SchoolSearcher:
     def discover_schools(
         self,
         counties: List[str],
-        state: str = 'Texas',
+        state: str = None,
         batch_size: int = 0,
         max_search_terms: int = None
     ) -> Iterator[School]:
@@ -358,10 +395,14 @@ class SchoolSearcher:
         
         Args:
             counties: List of county names to search
-            state: State to search (default: Texas)
+            state: State to search (default: uses self.target_state)
             batch_size: Number of counties to search (0 = all)
             max_search_terms: Max search queries per county (None = all)
         """
+        # Use target_state if state not provided
+        if state is None:
+            state = self.full_state_name
+        
         print("\n" + "="*70)
         print(f"STREAMING SCHOOL DISCOVERY - {state.upper()}")
         print("="*70)
@@ -412,7 +453,7 @@ class SchoolSearcher:
         print(f"Counties searched: {self.stats['counties_searched']}")
         print(f"Total schools found: {self.stats['total_schools_found']}")
         print(f"Schools with websites: {self.stats['schools_with_websites']}")
-        print(f"Non-Texas skipped: {self.stats['non_texas_skipped']}")
+        print(f"Non-{state} skipped: {self.stats['non_state_skipped']}")
         print(f"Total API calls: {self.stats['total_api_calls']}")
         print(f"Time elapsed: {elapsed/60:.1f} minutes")
         print("="*70)
@@ -420,7 +461,7 @@ class SchoolSearcher:
     def discover_schools_cities(
         self,
         cities: List[str],
-        state: str = 'Texas',
+        state: str = None,
         num_cities: int = 5
     ) -> Iterator[School]:
         """
@@ -429,9 +470,12 @@ class SchoolSearcher:
         
         Args:
             cities: List of city names to choose from
-            state: State to search (default: Texas)
+            state: State to search (default: uses self.target_state)
             num_cities: Number of random cities to search (default: 5)
         """
+        # Use target_state if state not provided
+        if state is None:
+            state = self.full_state_name
         print("\n" + "="*70)
         print(f"STREAMING SCHOOL DISCOVERY BY CITY - {state.upper()}")
         print("="*70)
@@ -479,7 +523,7 @@ class SchoolSearcher:
         print(f"Cities searched: {self.stats['counties_searched']}")
         print(f"Total schools found: {self.stats['total_schools_found']}")
         print(f"Schools with websites: {self.stats['schools_with_websites']}")
-        print(f"Non-Texas skipped: {self.stats['non_texas_skipped']}")
+        print(f"Non-{state} skipped: {self.stats['non_state_skipped']}")
         print(f"Total API calls: {self.stats['total_api_calls']}")
         print(f"Time elapsed: {elapsed/60:.1f} minutes")
         print("="*70)
