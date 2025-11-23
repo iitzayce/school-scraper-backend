@@ -13,6 +13,7 @@ ENV/
 *.csv
 *.txt
 !requirements.txt
+!data/states/*.txt
 
 # API Keys (NEVER commit these!)
 .env
