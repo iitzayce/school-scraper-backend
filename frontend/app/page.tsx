@@ -28,6 +28,11 @@ type PipelineSummary = {
   estimatedTimeRemaining?: number;
   currentStep?: number;
   totalSteps?: number;
+  countiesProcessed?: number;
+  totalCounties?: number;
+  currentCounty?: string;
+  currentCountyIndex?: number;
+  statusMessage?: string;
 };
 
 type ViewState = "start" | "progress" | "summary";
