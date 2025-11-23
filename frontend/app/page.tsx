@@ -138,6 +138,20 @@ export default function Home() {
       });
 
       if (!response.ok) {
+        // If 404, the run ID doesn't exist (likely an error occurred during initialization)
+        if (response.status === 404) {
+          const errorData = await response.json().catch(() => ({ error: "Run ID not found" }));
+          // Stop polling
+          if (pollingInterval) {
+            clearInterval(pollingInterval);
+            setPollingInterval(null);
+          }
+          setError(errorData.error || "Pipeline failed to start. The run ID was not found on the server.");
+          setStatus("Pipeline failed");
+          setIsRunning(false);
+          setSummary(null);
+          return;
+        }
         throw new Error(`Status check failed: ${response.status}`);
       }
 
