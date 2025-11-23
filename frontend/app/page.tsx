@@ -129,7 +129,7 @@ export default function Home() {
 
   async function checkPipelineStatus(runId: string) {
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "https://school-scraper-200036585956.us-central1.run.app";
+      const apiUrl = (process.env.NEXT_PUBLIC_API_URL || "https://school-scraper-200036585956.us-central1.run.app").replace(/\/+$/, '');
       const response = await fetch(`${apiUrl}/pipeline-status/${runId}`, {
         method: "GET",
         headers: {
@@ -215,7 +215,7 @@ export default function Home() {
     setEstimatedTime(null);
 
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "https://school-scraper-200036585956.us-central1.run.app";
+      const apiUrl = (process.env.NEXT_PUBLIC_API_URL || "https://school-scraper-200036585956.us-central1.run.app").replace(/\/+$/, '');
 
       const response = await fetch(`${apiUrl}/run-pipeline`, {
         method: "POST",
