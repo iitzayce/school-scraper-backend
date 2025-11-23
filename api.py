@@ -18,8 +18,8 @@ CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS
 
 def run_pipeline_steps(batch_size=50):
     """
-    Run all 5 pipeline steps in BATCH MODE with NO LIMITERS
-    Only limit: batch_size counties (default 50)
+    Run all 6 pipeline steps in BATCH MODE.
+    Counties are fully randomized; only global limits are API caps.
     """
     summary = {
         "status": "success",
@@ -32,12 +32,12 @@ def run_pipeline_steps(batch_size=50):
     
     try:
         # Step 1: School Discovery - BATCH MODE (NO LIMITERS)
-        print("Running Step 1: School Discovery (BATCH MODE - NO LIMITERS)...")
+        print("Running Step 1: School Discovery (Random counties, capped API calls)...")
         subprocess.run([
             "python3", "step1.py",
             "--api-key", os.getenv("GOOGLE_PLACES_API_KEY", ""),
             "--state", "Texas",
-            "--batch-counties", str(batch_size),  # BATCH MODE: exactly N counties, NO limiters
+            "--global-max-api-calls", "25",
             "--output", "step1_schools.csv"
         ], check=True, capture_output=True, timeout=3600)  # 60 minute timeout
         
@@ -51,100 +51,100 @@ def run_pipeline_steps(batch_size=50):
             "schoolsFound": schools_found
         })
         
-        # Step 1.5: Filter Schools (Churches, Camps, etc.)
-        print("Running Step 1.5: Filtering Schools...")
+        # Step 2: Filter Schools (Churches, Camps, etc.)
+        print("Running Step 2: Filtering Schools...")
         subprocess.run([
-            "python3", "step1.5.py",
+            "python3", "step2.py",
             "--input", "step1_schools.csv",
-            "--output", "step1.5_schools_filtered.csv"
+            "--output", "step2_schools_filtered.csv"
         ], check=True, capture_output=True, timeout=1800)  # 30 minute timeout
         
-        df1_5 = pd.read_csv("step1.5_schools_filtered.csv")
-        schools_filtered = len(df1_5)
+        df2 = pd.read_csv("step2_schools_filtered.csv")
+        schools_filtered = len(df2)
         summary["schoolsFound"] = schools_filtered  # Update with filtered count
         summary["steps"].append({
-            "name": "Step 1.5: Filter Schools",
+            "name": "Step 2: Filter Schools",
             "schoolsFiltered": schools_filtered
         })
         
-        # Step 2: Page Discovery - MAX 3 PAGES PER SCHOOL
-        print("Running Step 2: Page Discovery (MAX 3 PAGES PER SCHOOL)...")
+        # Step 3: Page Discovery - MAX 3 PAGES PER SCHOOL
+        print("Running Step 3: Page Discovery (MAX 3 PAGES PER SCHOOL)...")
         subprocess.run([
-            "python3", "step2.py",
-            "--input", "step1.5_schools_filtered.csv",  # Use filtered schools
-            "--output", "step2_pages.csv",
+            "python3", "step3.py",
+            "--input", "step2_schools_filtered.csv",  # Use filtered schools
+            "--output", "step3_pages.csv",
             "--max-pages-per-school", "3",  # Max 3 staff pages per school
             "--top-pages-limit", "3",  # Max 3 pages per school
             "--max-depth", "3"
         ], check=True, capture_output=True, timeout=3600)  # 60 minute timeout
         
-        df2 = pd.read_csv("step2_pages.csv")
-        pages_found = len(df2)
+        df3 = pd.read_csv("step3_pages.csv")
+        pages_found = len(df3)
         summary["steps"].append({
-            "name": "Step 2: Page Discovery",
+            "name": "Step 3: Page Discovery",
             "pagesDiscovered": pages_found
         })
         
-        # Step 3: Content Collection - NO LIMITERS
-        print("Running Step 3: Content Collection (NO LIMITERS)...")
+        # Step 4: Content Collection - NO LIMITERS
+        print("Running Step 4: Content Collection (NO LIMITERS)...")
         subprocess.run([
-            "python3", "step3.py",
-            "--input", "step2_pages.csv",
-            "--output", "step3_content.csv"
+            "python3", "step4.py",
+            "--input", "step3_pages.csv",
+            "--output", "step4_content.csv"
         ], check=True, capture_output=True, timeout=7200)  # 120 minute timeout for Selenium
         
-        df3 = pd.read_csv("step3_content.csv")
-        emails_found = df3['email_count'].sum() if 'email_count' in df3.columns else 0
+        df4 = pd.read_csv("step4_content.csv")
+        emails_found = df4['email_count'].sum() if 'email_count' in df4.columns else 0
         summary["steps"].append({
-            "name": "Step 3: Content Collection",
+            "name": "Step 4: Content Collection",
             "emailsFound": int(emails_found)
         })
         
-        # Step 4: LLM Parsing - NO LIMITERS
-        print("Running Step 4: LLM Parsing (NO LIMITERS)...")
+        # Step 5: LLM Parsing - NO LIMITERS
+        print("Running Step 5: LLM Parsing (NO LIMITERS)...")
         subprocess.run([
-            "python3", "step4.py",
-            "--input", "step3_content.csv",
-            "--output", "step4_contacts_with_emails.csv",
-            "--output-no-emails", "step4_contacts_no_emails.csv",
+            "python3", "step5.py",
+            "--input", "step4_content.csv",
+            "--output", "step5_contacts_with_emails.csv",
+            "--output-no-emails", "step5_contacts_no_emails.csv",
             "--api-key", os.getenv("OPENAI_API_KEY", ""),
             "--model", "gpt-4o-mini"
         ], check=True, capture_output=True, timeout=7200)  # 120 minute timeout for LLM
         
-        # Read both CSV files from Step 4
+        # Read both CSV files from Step 5
         contacts_with_emails = 0
         contacts_without_emails = 0
-        if os.path.exists("step4_contacts_with_emails.csv"):
-            df4_with = pd.read_csv("step4_contacts_with_emails.csv")
-            contacts_with_emails = len(df4_with)
-        if os.path.exists("step4_contacts_no_emails.csv"):
-            df4_without = pd.read_csv("step4_contacts_no_emails.csv")
-            contacts_without_emails = len(df4_without)
+        if os.path.exists("step5_contacts_with_emails.csv"):
+            df5_with = pd.read_csv("step5_contacts_with_emails.csv")
+            contacts_with_emails = len(df5_with)
+        if os.path.exists("step5_contacts_no_emails.csv"):
+            df5_without = pd.read_csv("step5_contacts_no_emails.csv")
+            contacts_without_emails = len(df5_without)
         
         summary["steps"].append({
-            "name": "Step 4: LLM Parsing",
+            "name": "Step 5: LLM Parsing",
             "contactsWithEmails": contacts_with_emails,
             "contactsWithoutEmails": contacts_without_emails
         })
         
-        # Step 5: Final Compilation (process contacts WITH emails)
-        print("Running Step 5: Final Compilation...")
-        csv_output_path = "step5_final_contacts.csv"
-        csv_no_emails_path = "step5_final_contacts_no_emails.csv"
+        # Step 6: Final Compilation (process contacts WITH emails)
+        print("Running Step 6: Final Compilation...")
+        csv_output_path = "step6_final_contacts.csv"
+        csv_no_emails_path = "step6_final_contacts_no_emails.csv"
         
         # Process contacts with emails
-        if os.path.exists("step4_contacts_with_emails.csv"):
+        if os.path.exists("step5_contacts_with_emails.csv"):
             subprocess.run([
-                "python3", "step5.py",
-                "--input", "step4_contacts_with_emails.csv",
+                "python3", "step6.py",
+                "--input", "step5_contacts_with_emails.csv",
                 "--output", csv_output_path
             ], check=True, capture_output=True)
         
         # Process contacts without emails (for enrichment)
-        if os.path.exists("step4_contacts_no_emails.csv"):
+        if os.path.exists("step5_contacts_no_emails.csv"):
             subprocess.run([
-                "python3", "step5.py",
-                "--input", "step4_contacts_no_emails.csv",
+                "python3", "step6.py",
+                "--input", "step5_contacts_no_emails.csv",
                 "--output", csv_no_emails_path
             ], check=True, capture_output=True)
         
@@ -161,7 +161,7 @@ def run_pipeline_steps(batch_size=50):
         summary["totalContacts"] = final_contacts_with_emails
         summary["totalContactsNoEmails"] = final_contacts_without_emails
         summary["steps"].append({
-            "name": "Step 5: Final Compilation",
+            "name": "Step 6: Final Compilation",
             "finalContactsWithEmails": final_contacts_with_emails,
             "finalContactsWithoutEmails": final_contacts_without_emails
         })
@@ -205,9 +205,9 @@ def run_pipeline():
         # Read the final CSV files and include them in response
         if summary.get("status") == "success":
             # Read contacts WITH emails
-            csv_path = summary.get("_csvPath", "step5_final_contacts.csv")
+            csv_path = summary.get("_csvPath", "step6_final_contacts.csv")
             if not os.path.exists(csv_path):
-                csv_path = os.path.join(os.getcwd(), "step5_final_contacts.csv")
+                csv_path = os.path.join(os.getcwd(), "step6_final_contacts.csv")
             
             if os.path.exists(csv_path):
                 try:
@@ -221,9 +221,9 @@ def run_pipeline():
                     print(f"ERROR: Error reading CSV file: {e}")
             
             # Read contacts WITHOUT emails
-            csv_no_emails_path = summary.get("_csvNoEmailsPath", "step5_final_contacts_no_emails.csv")
+            csv_no_emails_path = summary.get("_csvNoEmailsPath", "step6_final_contacts_no_emails.csv")
             if not os.path.exists(csv_no_emails_path):
-                csv_no_emails_path = os.path.join(os.getcwd(), "step5_final_contacts_no_emails.csv")
+                csv_no_emails_path = os.path.join(os.getcwd(), "step6_final_contacts_no_emails.csv")
             
             if os.path.exists(csv_no_emails_path):
                 try:

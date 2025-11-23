@@ -11,13 +11,15 @@ import requests
 import csv
 import time
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import argparse
 import random
+import re
 
 class SchoolSearcher:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, global_max_api_calls: int = None):
         self.api_key = api_key
+        self.global_max_api_calls = global_max_api_calls
         self.base_url = "https://places.googleapis.com/v1/places:searchText"
         self.all_schools = []
         self.seen_place_ids = set()
@@ -25,18 +27,63 @@ class SchoolSearcher:
             'counties_searched': 0,
             'total_api_calls': 0,
             'total_schools_found': 0,
-            'schools_with_websites': 0
+            'schools_with_websites': 0,
+            'non_texas_skipped': 0
         }
+
+    def _hit_global_limit(self) -> bool:
+        return (
+            self.global_max_api_calls is not None and
+            self.stats['total_api_calls'] >= self.global_max_api_calls
+        )
+
+    def _extract_state_and_county(self, place: Dict) -> Tuple[str, str]:
+        """
+        Parse addressComponents to pull out the state (level 1) and county (level 2)
+        """
+        state_value = ''
+        county_value = ''
+        for component in place.get('addressComponents', []):
+            types = component.get('types', [])
+            text_value = component.get('shortText') or component.get('longText') or component.get('text') or ''
+            text_value = text_value.strip()
+            if 'administrative_area_level_1' in types and not state_value:
+                state_value = text_value
+            if 'administrative_area_level_2' in types and not county_value:
+                county_value = text_value
+        return state_value, county_value
+
+    def _is_texas_result(self, detected_state: str, formatted_address: str) -> bool:
+        """
+        Determine if the result belongs to Texas using multiple signals
+        """
+        if detected_state:
+            normalized_state = detected_state.strip().lower()
+            if normalized_state in ('tx', 'texas'):
+                return True
+
+        address_upper = (formatted_address or '').upper()
+        if ', TX ' in address_upper or address_upper.endswith(', TX') or ' TEXAS' in address_upper:
+            return True
+
+        # Last fallback: look for state abbreviation pattern
+        match = re.search(r',\s*([A-Z]{2})\s+\d{5}', formatted_address or '')
+        if match and match.group(1) == 'TX':
+            return True
+
+        return False
 
     def search_county(
         self,
         county: str,
         state: str = 'Texas',
         max_search_terms: int = None,
-        max_api_calls: int = None
+        max_api_calls: int = None,
+        per_county_api_limit: int = None
     ) -> tuple:
         """Search for Christian schools in a specific county"""
         schools = []
+        county_api_calls = 0
         
         # Define search terms for Christian schools
         search_terms = [
@@ -64,17 +111,24 @@ class SchoolSearcher:
         county_new_schools = 0
 
         for query in search_terms:
-            if max_api_calls is not None and self.stats['total_api_calls'] >= max_api_calls:
+            if (
+                (max_api_calls is not None and self.stats['total_api_calls'] >= max_api_calls) or
+                self._hit_global_limit()
+            ):
                 print("    API call limit reached for this run. Stopping further queries.")
+                break
+            if per_county_api_limit is not None and county_api_calls >= per_county_api_limit:
+                print("    Per-county API call cap reached. Moving to next county.")
                 break
 
             try:
                 self.stats['total_api_calls'] += 1
+                county_api_calls += 1
                 
                 headers = {
                     'Content-Type': 'application/json',
                     'X-Goog-Api-Key': self.api_key,
-                    'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,places.types,places.businessStatus'
+                    'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,places.types,places.businessStatus,places.addressComponents'
                 }
                 
                 data = {'textQuery': query, 'pageSize': 20}
@@ -86,8 +140,13 @@ class SchoolSearcher:
                         for place in result['places']:
                             place_id = place.get('id', '')
                             types = place.get('types', [])
-                            name = place.get('displayName', {}).get('text', '').lower()
-                            address = place.get('formattedAddress', '').lower()
+                            address = place.get('formattedAddress', '')
+
+                            detected_state, detected_county = self._extract_state_and_county(place)
+
+                            if not self._is_texas_result(detected_state, address):
+                                self.stats['non_texas_skipped'] += 1
+                                continue
 
                             # === SIMPLE DEDUPLICATION ONLY ===
                             # No filtering - return all results from Google Places
@@ -108,8 +167,9 @@ class SchoolSearcher:
                                 'user_ratings': place.get('userRatingCount', ''),
                                 'types': ', '.join(types),
                                 'business_status': place.get('businessStatus', ''),
-                                'county': county,
-                                'state': state,
+                                'county': (detected_county or county).replace('County', '').strip(),
+                                'state': 'Texas',
+                                'detected_state': detected_state or '',
                                 'found_via': query.split(' in ')[0]
                             }
                             schools.append(school)
@@ -122,6 +182,13 @@ class SchoolSearcher:
             except Exception as e:
                 print(f"    Error on query: {e}")
                 time.sleep(2)
+
+            if (
+                (max_api_calls is not None and self.stats['total_api_calls'] >= max_api_calls) or
+                self._hit_global_limit() or
+                (per_county_api_limit is not None and county_api_calls >= per_county_api_limit)
+            ):
+                break
 
         return schools, county_new_schools
 
@@ -179,15 +246,19 @@ class SchoolSearcher:
         counties: List[str],
         state: str,
         output_file: str,
-        batch_size: int = 50
+        batch_size: int = 0
     ):
-        """Search exactly N counties with NO limiters - full batch mode"""
+        """Search N (or all) counties with global API guardrails"""
         print("\n" + "="*70)
         print(f"BATCH MODE - {state.upper()}")
         print("="*70)
         print(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Batch size: {batch_size} counties")
-        print("NO LIMITERS - Searching all terms, all schools found")
+        print("Counties: random order, no per-county limit")
+        print(f"Global API call cap: {self.global_max_api_calls or 'None'}")
+        if batch_size is None or batch_size <= 0 or batch_size >= len(counties):
+            print(f"Batch size: ALL {len(counties)} counties (randomized)")
+        else:
+            print(f"Batch size: {batch_size} counties (randomized)")
         print("="*70 + "\n")
         
         start_time = time.time()
@@ -195,13 +266,18 @@ class SchoolSearcher:
         # Shuffle counties for randomness, then take batch_size
         shuffled_counties = counties.copy()
         random.shuffle(shuffled_counties)
-        batch_counties = shuffled_counties[:batch_size]
+        if batch_size is None or batch_size <= 0 or batch_size >= len(counties):
+            batch_counties = shuffled_counties
+        else:
+            batch_counties = shuffled_counties[:batch_size]
         
         print(f"Processing batch of {len(batch_counties)} counties...\n")
         
         for i, county in enumerate(batch_counties, 1):
+            if self._hit_global_limit():
+                print("Global API call cap reached. Ending batch early.")
+                break
             print(f"[{i}/{len(batch_counties)}] Searching {county} County...")
-            # NO LIMITERS - search all terms, no API call limit
             county_schools, new_count = self.search_county(
                 county,
                 state,
@@ -214,6 +290,9 @@ class SchoolSearcher:
             self.stats['total_schools_found'] = len(self.all_schools)
             
             print(f"    Found {new_count} new schools | Total: {self.stats['total_schools_found']}")
+            if self._hit_global_limit():
+                print("Global API call cap reached. Ending batch early.")
+                break
         
         self._save_to_csv(output_file)
         self._print_summary(time.time() - start_time, output_file)
@@ -237,7 +316,7 @@ class SchoolSearcher:
         
         start_time = time.time()
         counties_searched = []
-        max_counties_to_search = min(100, len(counties))  # Search up to 100 counties max to reach target
+        max_counties_to_search = len(counties)
         
         # Shuffle counties for randomness
         shuffled_counties = counties.copy()
@@ -247,7 +326,10 @@ class SchoolSearcher:
             if len(self.all_schools) >= target_schools:
                 break
                 
-            if max_api_calls is not None and self.stats['total_api_calls'] >= max_api_calls:
+            if (
+                (max_api_calls is not None and self.stats['total_api_calls'] >= max_api_calls) or
+                self._hit_global_limit()
+            ):
                 print(f"\nAPI call limit reached. Stopping county searches.")
                 break
             
@@ -278,6 +360,76 @@ class SchoolSearcher:
         elif len(self.all_schools) < target_schools:
             print(f"\nWarning: Only found {len(self.all_schools)} schools (requested {target_schools})")
         
+        self._save_to_csv(output_file)
+        self._print_summary(time.time() - start_time, output_file)
+
+    def search_split_counties_equal_calls(
+        self,
+        counties: List[str],
+        state: str,
+        output_file: str,
+        counties_to_pick: int = 5,
+        calls_per_county: int = 5
+    ):
+        """Pick N random counties and evenly split API calls among them"""
+        print("\n" + "="*70)
+        print(f"EQUAL-SPLIT COUNTY MODE - {state.upper()}")
+        print("="*70)
+        print(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Target counties: {counties_to_pick} | Calls per county: {calls_per_county}")
+        print(f"Global API call cap: {self.global_max_api_calls or 'None'}")
+        print("="*70 + "\n")
+
+        if not counties:
+            print("No counties provided.")
+            return
+
+        available_counties = counties.copy()
+        random.shuffle(available_counties)
+        selected_counties = available_counties[:min(counties_to_pick, len(available_counties))]
+
+        if self.global_max_api_calls is not None:
+            max_possible_calls = len(selected_counties) * calls_per_county
+            if self.global_max_api_calls < max_possible_calls:
+                adjusted_calls = max(1, self.global_max_api_calls // len(selected_counties))
+                print(f"Warning: Global cap ({self.global_max_api_calls}) < desired ({max_possible_calls}).")
+                print(f"Adjusting per-county calls to {adjusted_calls}.")
+                calls_per_county = adjusted_calls
+
+        start_time = time.time()
+        for idx, county in enumerate(selected_counties, 1):
+            if calls_per_county <= 0:
+                print("Per-county call budget exhausted. Ending early.")
+                break
+            if self._hit_global_limit():
+                print("Global API call cap reached. Ending selection early.")
+                break
+
+            remaining_global = None
+            if self.global_max_api_calls is not None:
+                remaining_global = self.global_max_api_calls - self.stats['total_api_calls']
+                if remaining_global <= 0:
+                    print("Global API call cap reached. Ending selection early.")
+                    break
+
+            effective_calls = calls_per_county
+            if remaining_global is not None:
+                effective_calls = min(calls_per_county, remaining_global)
+
+            print(f"[{idx}/{len(selected_counties)}] Searching {county} County "
+                  f"(up to {effective_calls} API calls)...")
+            county_schools, new_count = self.search_county(
+                county,
+                state,
+                max_search_terms=None,
+                max_api_calls=None,
+                per_county_api_limit=effective_calls
+            )
+            self.all_schools.extend(county_schools)
+            self.stats['counties_searched'] += 1
+            self.stats['total_schools_found'] = len(self.all_schools)
+            print(f"    Found {new_count} new schools | Total: {self.stats['total_schools_found']}")
+
         self._save_to_csv(output_file)
         self._print_summary(time.time() - start_time, output_file)
 
@@ -348,8 +500,21 @@ class SchoolSearcher:
 
     def _save_to_csv(self, filename: str):
         """Save results to CSV"""
-        fieldnames = ['place_id', 'name', 'address', 'website', 'phone', 'rating', 'user_ratings',
-                      'types', 'business_status', 'county', 'state', 'found_via']
+        fieldnames = [
+            'place_id',
+            'name',
+            'address',
+            'website',
+            'phone',
+            'rating',
+            'user_ratings',
+            'types',
+            'business_status',
+            'county',
+            'state',
+            'detected_state',
+            'found_via'
+        ]
         
         with open(filename, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -366,19 +531,43 @@ class SchoolSearcher:
         print(f"With Website: {self.stats['schools_with_websites']} "
               f"({self.stats['schools_with_websites']/max(1, self.stats['total_schools_found'])*100:.1f}%)")
         print(f"API Calls: {self.stats['total_api_calls']}")
+        if self.stats.get('non_texas_skipped'):
+            print(f"Skipped non-TX results: {self.stats['non_texas_skipped']}")
         print(f"File: {output_file}")
         print("="*70)
 
 
-# Texas counties list (abbreviated for testing - add more as needed)
+# Texas counties list (all 254 counties, alphabetical)
 TEXAS_COUNTIES = [
-    'Harris', 'Dallas', 'Tarrant', 'Bexar', 'Travis',  # Major cities first for testing
-    'Anderson', 'Andrews', 'Angelina', 'Aransas', 'Archer', 'Armstrong', 'Atascosa', 'Austin', 
-    'Bailey', 'Bandera', 'Bastrop', 'Baylor', 'Bee', 'Bell', 'Bexar', 'Blanco', 'Borden', 
-    'Bosque', 'Bowie', 'Brazoria', 'Brazos', 'Brewster', 'Briscoe', 'Brooks', 'Brown',
-    'Burleson', 'Burnet', 'Caldwell', 'Calhoun', 'Callahan', 'Cameron', 'Camp', 'Carson',
-    'Cass', 'Castro', 'Chambers', 'Cherokee', 'Childress', 'Clay', 'Cochran', 'Coke',
-    # Add more counties as needed for full runs (254 total)
+    "Anderson", "Andrews", "Angelina", "Aransas", "Archer", "Armstrong", "Atascosa", "Austin",
+    "Bailey", "Bandera", "Bastrop", "Baylor", "Bee", "Bell", "Bexar", "Blanco", "Borden", "Bosque",
+    "Bowie", "Brazoria", "Brazos", "Brewster", "Briscoe", "Brooks", "Brown", "Burleson", "Burnet",
+    "Caldwell", "Calhoun", "Callahan", "Cameron", "Camp", "Carson", "Cass", "Castro", "Chambers",
+    "Cherokee", "Childress", "Clay", "Cochran", "Coke", "Coleman", "Collin", "Collingsworth",
+    "Colorado", "Comal", "Comanche", "Concho", "Cooke", "Coryell", "Cottle", "Crane", "Crockett",
+    "Crosby", "Culberson", "Dallam", "Dallas", "Dawson", "Deaf Smith", "Delta", "Denton", "DeWitt",
+    "Dickens", "Dimmit", "Donley", "Duval", "Eastland", "Ector", "Edwards", "Ellis", "El Paso",
+    "Erath", "Falls", "Fannin", "Fayette", "Fisher", "Floyd", "Foard", "Fort Bend", "Franklin",
+    "Freestone", "Frio", "Gaines", "Galveston", "Garza", "Gillespie", "Glasscock", "Goliad",
+    "Gonzales", "Gray", "Grayson", "Gregg", "Grimes", "Guadalupe", "Hale", "Hall", "Hamilton",
+    "Hansford", "Hardeman", "Hardin", "Harris", "Harrison", "Hartley", "Haskell", "Hays", "Hemphill",
+    "Henderson", "Hidalgo", "Hill", "Hockley", "Hood", "Hopkins", "Houston", "Howard", "Hudspeth",
+    "Hunt", "Hutchinson", "Irion", "Jack", "Jackson", "Jasper", "Jeff Davis", "Jefferson", "Jim Hogg",
+    "Jim Wells", "Johnson", "Jones", "Karnes", "Kaufman", "Kendall", "Kenedy", "Kent", "Kerr",
+    "Kimble", "King", "Kinney", "Kleberg", "Knox", "La Salle", "Lamar", "Lamb", "Lampasas", "Lavaca",
+    "Lee", "Leon", "Liberty", "Limestone", "Lipscomb", "Live Oak", "Llano", "Loving", "Lubbock",
+    "Lynn", "Madison", "Marion", "Martin", "Mason", "Matagorda", "Maverick", "McCulloch", "McLennan",
+    "McMullen", "Medina", "Menard", "Midland", "Milam", "Mills", "Mitchell", "Montague", "Montgomery",
+    "Moore", "Morris", "Motley", "Nacogdoches", "Navarro", "Newton", "Nolan", "Nueces", "Ochiltree",
+    "Oldham", "Orange", "Palo Pinto", "Panola", "Parker", "Parmer", "Pecos", "Polk", "Potter",
+    "Presidio", "Rains", "Randall", "Reagan", "Real", "Red River", "Reeves", "Refugio", "Roberts",
+    "Robertson", "Rockwall", "Runnels", "Rusk", "Sabine", "San Augustine", "San Jacinto",
+    "San Patricio", "San Saba", "Schleicher", "Scurry", "Shackelford", "Shelby", "Sherman", "Smith",
+    "Somervell", "Starr", "Stephens", "Sterling", "Stonewall", "Sutton", "Swisher", "Tarrant",
+    "Taylor", "Terrell", "Terry", "Throckmorton", "Titus", "Tom Green", "Travis", "Trinity", "Tyler",
+    "Upshur", "Upton", "Uvalde", "Val Verde", "Van Zandt", "Victoria", "Walker", "Waller", "Ward",
+    "Washington", "Webb", "Wharton", "Wheeler", "Wichita", "Wilbarger", "Willacy", "Williamson",
+    "Wilson", "Winkler", "Wise", "Wood", "Yoakum", "Young", "Zapata", "Zavala"
 ]
 
 # Iowa counties list (abbreviated for testing - add more as needed)
@@ -402,18 +591,29 @@ if __name__ == "__main__":
     parser.add_argument('--max-schools', type=int, help='Maximum number of schools to collect (stops early when reached)')
     parser.add_argument('--random-county-sample', type=int, metavar='N', help='Pick a random county and return N random schools (testing mode)')
     parser.add_argument('--multiple-random-counties', type=int, metavar='N', help='Search multiple random counties until N schools are found')
-    parser.add_argument('--batch-counties', type=int, metavar='N', help='BATCH MODE: Search exactly N counties with NO limiters (all terms, all schools)')
+    parser.add_argument('--batch-counties', type=int, metavar='N', default=0, help='BATCH MODE: Search N counties (0 = all counties)')
+    parser.add_argument('--global-max-api-calls', type=int, default=25, help='Absolute cap on total Google Places API calls (default: 25)')
+    parser.add_argument('--split-five-counties', action='store_true',
+                        help='Pick 5 random counties and split API calls evenly across them (default 5 calls each)')
     
     args = parser.parse_args()
     
     # Select county list based on state
     counties = TEXAS_COUNTIES if args.state.lower() == 'texas' else IOWA_COUNTIES
     
-    searcher = SchoolSearcher(api_key=args.api_key)
+    searcher = SchoolSearcher(api_key=args.api_key, global_max_api_calls=args.global_max_api_calls)
     
     try:
+        if args.split_five_counties:
+            searcher.search_split_counties_equal_calls(
+                counties,
+                args.state,
+                args.output,
+                counties_to_pick=5,
+                calls_per_county=5
+            )
         # If batch-counties is specified, use batch mode (NO LIMITERS)
-        if args.batch_counties is not None:
+        elif args.batch_counties is not None:
             searcher.search_batch_counties(
                 counties,
                 args.state,
@@ -444,15 +644,15 @@ if __name__ == "__main__":
             # Otherwise use the normal search mode
             print(f"\nStarting Christian School Discovery for {args.state}...")
             time.sleep(2)
-            searcher.search_all_counties(
-                counties,
-                args.state,
-                args.output,
-                max_counties=args.max_counties,
-                max_search_terms=args.max_search_terms,
+        searcher.search_all_counties(
+            counties,
+            args.state,
+            args.output,
+            max_counties=args.max_counties,
+            max_search_terms=args.max_search_terms,
                 max_api_calls=args.max_api_calls,
                 max_schools=args.max_schools
-            )
+        )
     except KeyboardInterrupt:
         searcher._save_to_csv(args.output)
         print(f"\nInterrupted. Saved partial results to: {args.output}")

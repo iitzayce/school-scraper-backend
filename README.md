@@ -1,6 +1,6 @@
 # School Contact Scraper Pipeline
 
-A 5-step Python pipeline for discovering Christian schools and extracting decision-maker contact information (Principals, IT Directors, Facilities Directors, Security Directors, etc.) for security grant applications.
+A 7-step Python pipeline for discovering Christian schools and extracting decision-maker contact information (Principals, IT Directors, Facilities Directors, Security Directors, etc.) for security grant applications.
 
 ## 🎯 Overview
 
@@ -9,16 +9,30 @@ This pipeline automates the discovery and extraction of school administrator con
 ### Pipeline Flow
 
 ```
-Step 1: School Discovery (Google Places API)
+Step 1: School Discovery (Google Places API, random counties, capped calls)
     ↓
-Step 2: Page Discovery (Web Crawling)
+Step 2: School Filtering (remove churches/camps, enforce Texas-only)
     ↓
-Step 3: Content Collection (Beautiful Soup + Selenium)
+Step 3: Page Discovery (prioritized staff/admin pages)
     ↓
-Step 4: LLM Parsing (OpenAI GPT-3.5-turbo)
+Step 4: Content Collection (Beautiful Soup + Selenium)
     ↓
-Step 5: Final Validation & Compilation
+Step 5: Contact Extraction (OpenAI GPT-4o-mini - extracts ALL contacts, no filtering)
+    ↓
+Step 6: Title Filtering (OpenAI GPT-4o-mini - filters by administrative/leadership roles)
+    ↓
+Step 7: Final Validation & Compilation
 ```
+
+### Step Summaries
+
+1. **Step 1 – School Discovery**: Randomly cycles through all 254 Texas counties (shuffled) and makes up to 25 Google Places API calls to gather every Christian school candidate it can find.
+2. **Step 2 – Texas Filter**: Removes out-of-state hits, churches/camps, and anything that doesn't clearly identify as a school or academy.
+3. **Step 3 – Page Discovery**: Crawls each school website, scoring and prioritizing staff/admin URLs, and caps the output to the top 3 high-value internal pages per school.
+4. **Step 4 – Content Collection**: Downloads HTML for each prioritized page using requests first, then Selenium (click + hover) when emails are hidden behind interactions.
+5. **Step 5 – Contact Extraction**: Extracts ALL contacts from HTML using GPT-4o-mini. No filtering - extracts everyone found (teachers, coaches, administrators, etc.).
+6. **Step 6 – Title Filtering**: Uses GPT-4o-mini to filter contacts by title, keeping only administrative/leadership roles (principals, directors, superintendents, etc.) and excluding teachers, coaches, board members, etc.
+7. **Step 7 – Final Compilation**: Validates names/emails, drops placeholders, deduplicates by email/name, assigns confidence scores, and produces final outreach-ready CSVs (emails + enrichment-ready leads).
 
 ## 📋 Requirements
 
@@ -45,7 +59,7 @@ urllib3>=2.0.0
    - Get from: [Google Cloud Console](https://console.cloud.google.com/)
    - Enable: Places API (New)
 
-2. **OpenAI API Key** - For Step 4 (LLM parsing)
+2. **OpenAI API Key** - For Step 5 (LLM parsing)
    - Get from: [OpenAI Platform](https://platform.openai.com/api-keys)
 
 ### System Requirements
@@ -71,93 +85,102 @@ pip install -r requirements.txt
 
 ### 3. Run Pipeline
 
-#### Step 1: Discover Schools
+#### Step 1: Discover Schools (Random counties, capped API calls)
 
 ```bash
 python3 step1.py \
   --api-key YOUR_GOOGLE_PLACES_API_KEY \
   --state Texas \
-  --max-counties 1 \
-  --max-search-terms 2 \
-  --max-api-calls 10 \
+  --global-max-api-calls 25 \
   --output step1_schools.csv
 ```
 
 **Options:**
-- `--state`: State to search (Texas, Iowa, etc.)
-- `--max-counties`: Limit number of counties (for cost control)
-- `--max-search-terms`: Limit search queries per county
-- `--max-api-calls`: Total API call limit (cost control)
+- `--global-max-api-calls`: Absolute cap on Places API costs (default: 25 calls)
+- `--max-search-terms`: Optional limit per county
+- `--max-counties`: Optional hard cap on counties (default: all counties, randomized)
 
-#### Step 2: Discover Pages
+#### Step 2: Filter Non-Schools / Non-Texas
 
 ```bash
 python3 step2.py \
   --input step1_schools.csv \
-  --output step2_pages.csv \
-  --max-pages-per-school 30 \
-  --top-pages-limit 5
+  --output step2_schools_filtered.csv
 ```
 
-**Options:**
-- `--max-pages-per-school`: Max pages to discover per school (default: 30)
-- `--top-pages-limit`: Final filter - keep only top N pages by priority (default: 5)
-- `--max-depth`: Crawl depth (default: 2)
+**Features:**
+- Drops churches, camps, ministries unless they clearly contain a school keyword
+- Enforces Texas-only by checking Google address components + formatted addresses
 
-#### Step 3: Collect Content
+#### Step 3: Discover High-Value Pages
 
 ```bash
 python3 step3.py \
-  --input step2_pages.csv \
-  --output step3_content.csv
+  --input step2_schools_filtered.csv \
+  --output step3_pages.csv \
+  --max-pages-per-school 3 \
+  --top-pages-limit 3 \
+  --max-depth 3
 ```
 
 **Features:**
-- Fallback approach: Beautiful Soup first, then Selenium for dynamic content
-- Handles click/hover reveals for hidden emails
-- Collects HTML content for LLM parsing
+- Prioritizes staff/admin/leadership URLs via scoring system
+- Stops after 3 quality pages per school to control downstream costs
 
-#### Step 4: Parse with LLM
+#### Step 4: Collect Content (Requests + Selenium)
 
 ```bash
 python3 step4.py \
-  --input step3_content.csv \
-  --output step4_parsed_contacts.csv \
-  --api-key YOUR_OPENAI_API_KEY \
-  --model gpt-3.5-turbo
+  --input step3_pages.csv \
+  --output step4_content.csv
 ```
 
 **Features:**
-- Extracts ALL contacts from HTML
-- Filters by target titles (Principal, IT Director, Facilities, Security, etc.)
-- Uses fuzzy matching for title variations
-- Excludes non-relevant roles (Athletic Director, etc.)
+- Requests for fast/static sites, Selenium fallback for interactive content
+- Click/hover routines to reveal hidden emails
+- Stores HTML + metadata for every processed page
 
-#### Step 5: Final Validation
+#### Step 5: Parse with LLM (GPT-4o-mini)
 
 ```bash
 python3 step5.py \
-  --input step4_parsed_contacts.csv \
-  --output step5_final_contacts.csv
+  --input step4_content.csv \
+  --output step5_contacts_with_emails.csv \
+  --output-no-emails step5_contacts_no_emails.csv \
+  --api-key YOUR_OPENAI_API_KEY \
+  --model gpt-4o-mini
 ```
 
 **Features:**
-- Email validation
-- Name cleaning (removes generic text)
-- Phone formatting
-- Deduplication
-- Confidence scoring
+- Strict prompt (zero guessing) that filters forbidden titles
+- Produces separate CSVs for contacts with and without visible emails
+- HTML reduction + chunking to control token usage
+
+#### Step 6: Final Validation & Compilation
+
+```bash
+python3 step6.py \
+  --input step5_contacts_with_emails.csv \
+  --output step6_final_contacts.csv
+```
+
+Run again with `step5_contacts_no_emails.csv` to prep enrichment lists.
+
+**Features:**
+- Email/phone validation, name cleaning, deduplication
+- Confidence scoring + optional copy to Downloads folder
 
 ## Output Files
 
-- `step1_schools.csv` - Discovered schools with websites
-- `step2_pages.csv` - Discovered pages per school (prioritized)
-- `step3_content.csv` - Collected HTML content from pages
-- `step4_parsed_contacts.csv` - LLM-extracted contacts (filtered by title)
-- `step5_final_contacts.csv` - Final validated contacts
-- `step5_final_contacts_quality_report.txt` - Quality metrics report
+- `step1_schools.csv` - Discovered schools (raw Places output)
+- `step2_schools_filtered.csv` - Clean Texas-only schools
+- `step3_pages.csv` - Prioritized staff/admin pages per school
+- `step4_content.csv` - HTML content gathered via requests/Selenium
+- `step5_contacts_with_emails.csv` - LLM contacts with visible emails
+- `step5_contacts_no_emails.csv` - LLM contacts missing emails (enrichment queue)
+- `step6_final_contacts.csv` - Final validated contacts (ready for outreach)
 
-## 🎯 Target Titles (Step 4 Filtering)
+## 🎯 Target Titles (Step 5 Filtering)
 
 The pipeline filters for these decision-maker roles:
 
@@ -176,10 +199,10 @@ The pipeline filters for these decision-maker roles:
 - **Controls**: Use `--max-counties`, `--max-search-terms`, `--max-api-calls`
 - **Example**: 10 API calls = ~$0.17
 
-### OpenAI API (GPT-3.5-turbo)
-- **Cost**: ~$0.001 per page (varies by content size)
-- **Controls**: Limit pages per school (`--top-pages-limit`)
-- **Example**: 100 pages = ~$0.10
+### OpenAI API (GPT-4o-mini)
+- **Cost**: ~0.003 USD per rich staff page (after HTML reduction/chunking)
+- **Controls**: Limit pages per school (`--top-pages-limit`), chunk large pages, skip low-priority URLs
+- **Example**: 100 pages ≈ $0.30 (input + output tokens)
 
 ### Projected Costs
 - **5 schools**: ~$0.02 (LLM) + ~$0.17 (Places API) = **~$0.19**
@@ -275,7 +298,7 @@ vercel
 
 ### Customizing Target Titles
 
-Edit `step4.py` - modify the `target_titles` list in the `LLMParser.__init__` method:
+Edit `step5.py` - adjust the prompt or post-processing rules inside `LLMParser`:
 
 ```python
 self.target_titles = [
@@ -288,10 +311,10 @@ self.target_titles = [
 ### Selenium Issues
 - Ensure Chrome/Chromium is installed
 - ChromeDriver is auto-managed by Selenium 4+
-- For headless mode, add to `step3.py`: `options.add_argument('--headless')`
+- For headless mode, add to `step4.py`: `options.add_argument('--headless')`
 
 ### JSON Parse Errors
-- Step 4 now includes automatic recovery for truncated responses
+- Step 5 now includes automatic recovery for truncated responses
 - Large pages (>20 emails) automatically get higher token limits
 
 ### API Rate Limits

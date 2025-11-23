@@ -1,113 +1,81 @@
 """
-STEP 3: COLLECT PAGE CONTENT
-============================
-Collect HTML/text content from discovered pages using FALLBACK approach.
+STEP 3: DISCOVER SITE PAGES
+===========================
+Crawl each school's website to discover priority internal pages.
 
-Uses FALLBACK approach (per Giorgio's recommendation):
-1. TIER 1: Beautiful Soup (simple HTML) - fast, cheap (~40% of sites)
-2. TIER 2: If no emails found: Selenium (click/hover to reveal hidden emails)
-
-This step ONLY collects content - LLM parsing happens in Step 4.
-
-Input: CSV from Step 2 with all discovered pages
-Output: CSV with page URLs and their collected HTML/text content
+Input: CSV from Step 2 with filtered schools + websites
+Output: CSV with top-priority staff/admin pages per school
 """
 
 import requests
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from selenium.webdriver.common.action_chains import ActionChains
-import re
+from urllib.parse import urljoin, urlparse
 import csv
 import time
-from typing import List, Dict, Set, Optional
+from typing import List, Dict, Set
+import re
 import pandas as pd
-from collections import defaultdict
 
 
-class ContentCollector:
-    def __init__(self, timeout: int = 120, max_retries: int = 5, use_selenium: bool = True):
+class PageDiscoverer:
+    def __init__(self, timeout: int = 120, max_retries: int = 5):
         self.timeout = timeout  # Increased to 120 seconds
         self.max_retries = max_retries  # Increased retries
-        self.use_selenium = use_selenium
-        self.driver = None
-        
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
         
-        if use_selenium:
-            self.driver = self._setup_selenium()
+        # Configurable thresholds
+        self.min_priority_threshold = 20  # Minimum score to be included (pages below 20 are excluded)
         
-        # Email regex pattern (to check if we should try Selenium)
-        self.email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
-    
-    def extract_emails(self, html: str) -> Set[str]:
-        """Extract all email addresses from HTML"""
-        if not html:
-            return set()
+        # Keywords to prioritize pages likely to have decision-maker info
+        self.high_value_keywords = [
+            'staff', 'faculty', 'directory', 'administration', 'admin', 'team',
+            'leadership', 'our-team', 'who-we-are', 'meet-our', 'personnel',
+            'board', 'principal', 'superintendent'
+        ]
+        # Removed 'mission', 'vision', 'history' from support - they're now zero priority
+        self.support_value_keywords = ['about']
+        self.low_value_keywords = ['info', 'location']  # Removed 'contact' - it's now zero priority
         
-        # Parse HTML to get text content
-        soup = BeautifulSoup(html, 'html.parser')
+        # Keywords that immediately set score to 0 (ZERO priority - checked first)
+        self.zero_priority_keywords = [
+            # Contact pages
+            'contact', 'contact-us', 'contactus', 'contact_us',
+            # Admissions pages
+            'admission', 'admissions', 'apply', 'enrollment', 'enroll',
+            # Home and general pages
+            'home', 'index',
+            # Mission/vision/history pages (not useful for contacts)
+            'mission', 'vision', 'history',
+            # Calendar and events
+            'calendar', 'event', 'events',
+            # Sports and athletics
+            'athletic', 'athletics', 'sports',
+            # News and blog
+            'news', 'blog',
+            # Food service
+            'lunch', 'menu', 'cafeteria', 'dining',
+            # Forms and downloads
+            'forms', 'download', 'downloads',
+            # Employment
+            'employment', 'jobs', 'careers', 'hiring',
+            # Social media domains (in URL path)
+            'linktr.ee', 'facebook.com', 'instagram.com', 'twitter.com',
+            'youtube.com', 'vimeo.com', 'docs.google.com', 'drive.google.com'
+        ]
         
-        # Remove script and style elements
-        for script in soup(["script", "style"]):
-            script.decompose()
-        
-        # Get text
-        text = soup.get_text()
-        
-        # Find all emails
-        emails = set(self.email_pattern.findall(text))
-        
-        # Also check href attributes for mailto links
-        for link in soup.find_all('a', href=True):
-            if link['href'].startswith('mailto:'):
-                email = link['href'].replace('mailto:', '').split('?')[0]
-                emails.add(email)
-        
-        # Check data attributes that might contain emails
-        for element in soup.find_all(attrs={'data-email': True}):
-            emails.add(element.get('data-email', ''))
-        
-        for element in soup.find_all(attrs={'data-mailto': True}):
-            emails.add(element.get('data-mailto', ''))
-        
-        return emails
-    
-    def _setup_selenium(self):
-        """Initialize headless Chrome browser"""
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-        
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.set_page_load_timeout(180)  # Increased to 180 seconds
-        return driver
-    
-    def _ensure_driver_healthy(self):
-        """Check and restart Selenium driver if needed"""
-        if not self.driver:
-            return
-        
-        try:
-            self.driver.execute_script("return document.readyState")
-        except:
-            print("    Selenium driver crashed. Restarting...")
-            try:
-                self.driver.quit()
-            except:
-                pass
-            self.driver = self._setup_selenium()
+        # These are now in zero_priority_keywords, keeping for backward compatibility if needed
+        self.bad_url_keywords = [
+            'calendar', 'athletic', 'sports', 'admission', 'apply', 'enroll',
+            'event', 'news', 'blog', 'lunch', 'menu', 'forms', 'download',
+            'linktr.ee', 'facebook.com', 'instagram.com', 'twitter.com',
+            'youtube.com', 'vimeo.com', 'docs.google.com', 'drive.google.com'
+        ]
+        self.bad_domains = [
+            'linktr.ee', 'facebook.com', 'instagram.com', 'twitter.com',
+            'youtube.com', 'vimeo.com', 'docs.google.com', 'drive.google.com'
+        ]
     
     def safe_get(self, url: str) -> requests.Response:
         """Make HTTP request with retry logic"""
@@ -117,347 +85,328 @@ class ContentCollector:
                 response.raise_for_status()
                 return response
             except requests.exceptions.Timeout:
+                print(f"      Timeout on attempt {attempt + 1}/{self.max_retries}")
                 if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    time.sleep(2 ** attempt)  # Exponential backoff
                 else:
                     raise
-            except requests.exceptions.RequestException:
+            except requests.exceptions.RequestException as e:
+                print(f"      Request error: {e}")
                 if attempt < self.max_retries - 1:
                     time.sleep(2 ** attempt)
                 else:
                     raise
         return None
     
-    def fetch_with_selenium(self, url: str, interact: bool = True) -> Optional[str]:
-        """
-        Fetch page using Selenium and interact with it to reveal emails
-        
-        Clicks on profile photos, staff cards, and hovers over elements
-        to reveal hidden emails (mailto links that appear on interaction)
-        """
-        try:
-            self._ensure_driver_healthy()
-            self.driver.get(url)
-            
-            # Wait for page to load
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
-            time.sleep(2)  # Wait for any dynamic content
-            
-            if interact:
-                # Look for clickable elements that might reveal emails
-                # Common patterns: profile photos, staff cards, staff member containers
-                clickable_selectors = [
-                    "img[alt*='staff']", "img[alt*='team']", "img[alt*='faculty']",
-                    "[class*='staff']", "[class*='team']", "[class*='faculty']",
-                    "[class*='member']", "[class*='profile']", "[class*='card']",
-                    "a[href*='staff']", "a[href*='team']", "a[href*='faculty']",
-                    "[data-email]", "[data-mailto]", "[class*='email']"
-                ]
-                
-                for selector in clickable_selectors:
-                    try:
-                        elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                        # Increased to 75 clicks per selector type to handle large staff directories
-                        for element in elements[:75]:
-                            try:
-                                # Scroll element into view
-                                self.driver.execute_script("arguments[0].scrollIntoView(true);", element)
-                                time.sleep(0.5)
-                                
-                                # Try clicking
-                                element.click()
-                                time.sleep(0.5)
-                                
-                                # Try hovering
-                                ActionChains(self.driver).move_to_element(element).perform()
-                                time.sleep(0.3)
-                            except:
-                                continue
-                    except:
-                        continue
-                
-                # Additional wait for any JavaScript-revealed emails
-                time.sleep(2)
-            
-            return self.driver.page_source
-            
-        except Exception as e:
-            print(f"      Selenium error: {e}")
-            return None
-    
-    def extract_emails(self, html: str) -> Set[str]:
-        """Extract all email addresses from HTML"""
-        # Parse HTML to get text content
+    def extract_links(self, base_url: str, html: str) -> Set[str]:
+        """Extract all internal links from HTML"""
         soup = BeautifulSoup(html, 'html.parser')
+        links = set()
         
-        # Remove script and style elements
-        for script in soup(["script", "style"]):
-            script.decompose()
+        # Get domain for filtering internal links only
+        base_domain = urlparse(base_url).netloc
         
-        # Get text
-        text = soup.get_text()
+        # Keywords that indicate important hash fragments to preserve
+        important_fragment_keywords = ['team', 'staff', 'faculty', 'leadership', 'directory', 
+                                       'contact', 'about', 'administrat', 'office']
         
-        # Find all emails
-        emails = set(self.email_pattern.findall(text))
-        
-        # Also check href attributes for mailto links
         for link in soup.find_all('a', href=True):
-            if link['href'].startswith('mailto:'):
-                email = link['href'].replace('mailto:', '').split('?')[0]
-                emails.add(email)
-        
-        # Check data attributes that might contain emails
-        for element in soup.find_all(attrs={'data-email': True}):
-            emails.add(element.get('data-email', ''))
-        
-        for element in soup.find_all(attrs={'data-mailto': True}):
-            emails.add(element.get('data-mailto', ''))
-        
-        return emails
-    
-    def _setup_selenium(self):
-        """Initialize headless Chrome browser"""
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-        
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.set_page_load_timeout(180)  # Increased to 180 seconds
-        return driver
-    
-    def collect_page_content(self, school_name: str, url: str) -> Optional[Dict]:
-        """
-        Collect HTML content from a page using FALLBACK approach:
-        
-        1. TIER 1: Try Beautiful Soup (simple HTML) - fast, cheap (~40% of sites)
-        2. TIER 2: If no emails found: Try Selenium (click/hover to reveal hidden emails)
-        
-        Returns:
-            Dictionary with school_name, url, html_content, fetch_method, email_count
-            Returns None if page fetch failed
-        """
-        try:
-            html = None
-            fetch_method = 'unknown'
+            href = link['href']
             
-            # TIER 1: Try Beautiful Soup first (simple HTML scraping)
-            response = self.safe_get(url)
-            if response:
-                html = response.text
-                fetch_method = 'requests'
+            # Convert relative URLs to absolute
+            full_url = urljoin(base_url, href)
+            
+            # Parse URL
+            parsed = urlparse(full_url)
+            
+            # Only include internal links from same domain
+            if parsed.netloc == base_domain:
+                # Check if fragment contains important keywords
+                fragment = parsed.fragment.lower() if parsed.fragment else ''
+                has_important_fragment = any(keyword in fragment for keyword in important_fragment_keywords)
                 
-                # Check for emails and staff indicators
-                emails = self.extract_emails(html)
-                soup = BeautifulSoup(html, 'html.parser')
-                text_lower = soup.get_text().lower()
-                
-                # Check for high-value titles/names that indicate staff pages
-                high_value_keywords = [
-                    'principal', 'superintendent', 'head of school', 'director',
-                    'administrator', 'dean', 'assistant principal', 'vice principal'
-                ]
-                has_high_value_titles = any(keyword in text_lower for keyword in high_value_keywords)
-                
-                # Check for name patterns (likely person names)
-                name_pattern = re.search(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', soup.get_text())
-                has_name_pattern = bool(name_pattern)
-                
-                # Use Selenium if:
-                # 1. No emails found, OR
-                # 2. Has high-value titles/names (even if emails found - might be more in Selenium)
-                should_use_selenium = (not emails or len(emails) == 0) or (has_high_value_titles and has_name_pattern)
-                
-                if should_use_selenium:
-                    if not emails or len(emails) == 0:
-                        print(f"    No emails in HTML, trying Selenium (click/hover reveals)...")
-                    else:
-                        print(f"    Found {len(emails)} emails + high-value titles detected, using Selenium for comprehensive extraction...")
-                    
-                    # TIER 2: Use Selenium for better extraction
-                    if self.use_selenium:
-                        html_selenium = self.fetch_with_selenium(url, interact=True)
-                        if html_selenium:
-                            html = html_selenium
-                            fetch_method = 'selenium'
-                            
-                            # Re-check emails after Selenium
-                            emails_after = self.extract_emails(html)
-                            if emails_after:
-                                print(f"    Found {len(emails_after)} emails via Selenium (was {len(emails) if emails else 0})")
-                                emails = emails_after
+                # Preserve fragment if it contains important keywords, otherwise remove it
+                if has_important_fragment and parsed.fragment:
+                    # Keep the fragment for important sections
+                    clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}#{parsed.fragment}"
                 else:
-                    print(f"    Found {len(emails)} emails via simple HTML")
-            else:
-                # If requests failed, try Selenium directly
-                if self.use_selenium:
-                    print(f"    WARNING: Requests failed, trying Selenium...")
-                    html_selenium = self.fetch_with_selenium(url, interact=True)
-                    if html_selenium:
-                        html = html_selenium
-                        fetch_method = 'selenium'
-            
-            # If we still have no HTML at this point, page fetch failed
-            if not html:
-                print(f"    ERROR: Failed to fetch page content")
-                return None
-            
-            # Count emails found
-            emails = self.extract_emails(html)
-            email_count = len(emails)
-            
-            return {
-                'school_name': school_name,
-                'url': url,
-                'html_content': html,
-                'fetch_method': fetch_method,
-                'email_count': email_count,
-                'has_emails': email_count > 0
-            }
-            
-        except Exception as e:
-            print(f"      Error collecting content from {url}: {e}")
-            return None
+                    # Remove fragments and query params for cleaner URLs (standard behavior)
+                    clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                
+                # Skip common non-content URLs
+                skip_patterns = [
+                    r'\.pdf$', r'\.jpg$', r'\.png$', r'\.gif$', r'\.jpeg$',
+                    r'\.doc$', r'\.docx$', r'\.zip$', r'\.mp4$', r'\.mp3$',
+                    r'/wp-admin/', r'/wp-login', r'/wp-content/uploads/',
+                    r'javascript:', r'mailto:', r'tel:'
+                ]
+                
+                # Skip patterns check (removed '#' from patterns since we're preserving some)
+                if not any(re.search(pattern, clean_url, re.IGNORECASE) for pattern in skip_patterns):
+                    links.add(clean_url)
+        
+        return links
+
+    def score_page_priority(self, url: str) -> int:
+        """Score URL based on likelihood of containing contact info"""
+        url_lower = url.lower()
+        parsed = urlparse(url_lower)
+        netloc = parsed.netloc
+        score = 0
+        
+        # ZERO PRIORITY: Contact and admissions pages (emails never there)
+        for keyword in self.zero_priority_keywords:
+            if keyword in url_lower:
+                return 0  # Immediately return 0 - these pages are worthless
+        
+        for keyword in self.high_value_keywords:
+            if keyword in url_lower:
+                score += 25
+        for keyword in self.support_value_keywords:
+            if keyword in url_lower:
+                score += 10
+        for keyword in self.low_value_keywords:
+            if keyword in url_lower:
+                score += 5
+        
+        # Penalize low-value keywords / hosts
+        for keyword in self.bad_url_keywords:
+            if keyword in url_lower:
+                score -= 25
+        if any(bad_domain in netloc for bad_domain in self.bad_domains):
+            score -= 40
+        
+        # EXTRA BOOST for hash fragments indicating team/staff pages
+        if '#' in url_lower:
+            hash_part = url_lower.split('#')[1]
+            hash_keywords = ['team', 'staff', 'faculty', 'leadership', 'directory', 'admin']
+            if any(keyword in hash_part for keyword in hash_keywords):
+                score += 20
+        
+        return score
     
-    def collect_content_from_pages(self, input_csv: str, output_csv: str):
+    def score_page_content(self, soup: BeautifulSoup) -> int:
+        """Boost score based on page content (names, emails, headings)"""
+        content_score = 0
+        text = soup.get_text(separator=' ', strip=True)
+        
+        # Count emails on page
+        mailto_links = soup.select('a[href^="mailto:"]')
+        mailto_count = len(mailto_links)
+        if mailto_count >= 5:
+            content_score += 40
+        elif mailto_count >= 2:
+            content_score += 25
+        elif mailto_count == 1:
+            content_score += 10
+        
+        # Names pattern detection (simple heuristic)
+        name_matches = re.findall(r'[A-Z][a-z]+\\s[A-Z][a-z]+', text)
+        if len(name_matches) >= 10:
+            content_score += 30
+        elif len(name_matches) >= 5:
+            content_score += 15
+        
+        # Heading keywords
+        heading_text = ' '.join([h.get_text(separator=' ', strip=True).lower() for h in soup.find_all(['h1', 'h2', 'h3'])])
+        for keyword in self.high_value_keywords:
+            if keyword in heading_text:
+                content_score += 10
+                break
+        
+        return content_score
+
+    def discover_pages(self, school_name: str, base_url: str, max_depth: int = 3, max_pages_per_school: int = 3, top_pages_limit: int = 3) -> List[Dict]:
         """
-        Collect HTML content from all pages in the input CSV
-        
-        Process:
-        1. Read all pages from Step 2
-        2. For each page: Use fallback approach (Beautiful Soup → Selenium)
-        3. Save page content (HTML) to CSV for LLM parsing in Step 4
-        
-        Uses FALLBACK approach per Giorgio's recommendation:
-        - TIER 1: Try Beautiful Soup first (fast, cheap) - handles ~40% of sites
-        - TIER 2: If no emails: Try Selenium (click/hover to reveal)
-        
-        This step ONLY collects content - LLM parsing happens in Step 4.
+        Discover all pages on a school website
         
         Args:
-            input_csv: CSV from Step 2 with discovered pages
-            output_csv: Output CSV with collected page content
+            school_name: Name of the school
+            base_url: Homepage URL
+            max_depth: Maximum crawl depth (default 2)
+            max_pages_per_school: Maximum pages to discover per school (default 30)
+        
+        Returns:
+            List of page dictionaries with URL, title, and priority score
+        """
+        print(f"\n  Discovering pages for: {school_name}")
+        print(f"  Base URL: {base_url}")
+        
+        if not base_url or base_url == '':
+            print("    WARNING: No website URL provided")
+            return []
+        
+        visited = set()
+        # Use priority queue: (negative_priority, depth, url) - negative for max-heap behavior
+        import heapq
+        to_visit = []
+        heapq.heappush(to_visit, (0, 0, base_url))  # Start with homepage (priority 0)
+        discovered_pages = []
+        high_priority_found = 0  # Count pages with score >= 40
+        
+        while to_visit and len(discovered_pages) < max_pages_per_school:
+            # Pop highest priority page
+            neg_priority, depth, current_url = heapq.heappop(to_visit)
+            priority_estimate = -neg_priority
+            
+            # Skip if already visited or max depth reached
+            if current_url in visited or depth > max_depth:
+                continue
+            
+            # Early stopping: if we found enough pages, stop crawling
+            if len(discovered_pages) >= max_pages_per_school:
+                break
+            
+            # Skip zero-priority pages (contact, admissions, home, mission, etc.) - but allow homepage (depth 0)
+            if priority_estimate <= 0 and depth > 0:
+                continue
+            
+            visited.add(current_url)
+            
+            try:
+                response = self.safe_get(current_url)
+                if not response:
+                    continue
+                
+                # Extract page title
+                soup = BeautifulSoup(response.text, 'html.parser')
+                title = soup.find('title')
+                title_text = title.get_text().strip() if title else ''
+                
+                # Calculate priority score
+                priority = self.score_page_priority(current_url)
+                priority += self.score_page_content(soup)
+                
+                # Track high-priority pages
+                if priority >= 30:
+                    high_priority_found += 1
+                
+                # Store page info (we'll filter by threshold later)
+                page_info = {
+                'school_name': school_name,
+                    'url': current_url,
+                    'title': title_text,
+                    'priority_score': priority,
+                    'depth': depth
+                }
+                discovered_pages.append(page_info)
+                
+                # Extract links for next level crawl (if not at max depth and not at page limit)
+                if depth < max_depth and len(discovered_pages) < max_pages_per_school:
+                    new_links = self.extract_links(base_url, response.text)
+                    
+                    # Prioritize links: score them before adding to queue
+                    scored_links = []
+                    for link in new_links:
+                        if link not in visited:
+                            link_priority = self.score_page_priority(link)
+                            scored_links.append((link, link_priority))
+                    
+                    # Sort by priority and add top links first (increased to 75 per page for comprehensive coverage)
+                    scored_links.sort(key=lambda x: x[1], reverse=True)
+                    for link, link_priority in scored_links[:75]:
+                        if link not in visited and len(discovered_pages) < max_pages_per_school:
+                            heapq.heappush(to_visit, (-link_priority, depth + 1, link))
+                
+                time.sleep(0.5)  # Polite crawling delay
+            
+        except Exception as e:
+                print(f"    Error crawling {current_url}: {e}")
+                continue
+        
+        # Sort by priority score (highest first)
+        discovered_pages.sort(key=lambda x: x['priority_score'], reverse=True)
+        
+        # Filter out pages below threshold (score must be >= 20)
+        valid_pages = [page for page in discovered_pages if page['priority_score'] >= self.min_priority_threshold]
+        
+        # Limit to top 3 pages per school (highest scores)
+        discovered_pages = valid_pages[:3]
+        
+        print(f"    Discovered {len(discovered_pages)} pages (top 3 with score >= {self.min_priority_threshold})")
+        if discovered_pages:
+            print(f"    Pages found:")
+            for page in discovered_pages:
+                print(f"      - {page['title'][:50]} (score: {page['priority_score']})")
+        else:
+            print(f"    No pages met the minimum threshold of {self.min_priority_threshold}")
+        
+        return discovered_pages
+
+    def process_schools_csv(self, input_csv: str, output_csv: str, max_depth: int = 3, max_pages_per_school: int = 3, top_pages_limit: int = 3):
+        """
+        Process schools from Step 1 CSV and discover all their pages
+        
+        Args:
+            input_csv: CSV file from Step 1 with school data
+            output_csv: Output CSV with discovered pages
+            max_depth: Maximum crawl depth
+            max_pages_per_school: Maximum pages per school
         """
         print("\n" + "="*70)
-        print("STEP 3: COLLECTING PAGE CONTENT")
-        print("="*70)
-        print("Using FALLBACK approach: Beautiful Soup → Selenium")
+        print("STEP 3: PAGE DISCOVERY")
         print("="*70)
         
-        # Read discovered pages
+        # Read input CSV
         df = pd.read_csv(input_csv)
         
-        print(f"Processing {len(df)} pages from {df['school_name'].nunique()} schools")
+        # Filter to schools with websites (process ALL schools)
+        df_with_urls = df[df['website'].notna() & (df['website'] != '')]
+        
+        print(f"Processing {len(df_with_urls)} schools with websites")
         print("="*70 + "\n")
         
-        all_content = []
+        all_pages = []
         
-        for idx, row in df.iterrows():
-            school_name = row['school_name']
-            url = row['url']
+        for idx, row in df_with_urls.iterrows():
+            school_name = row['name']
+            base_url = row['website']
             
-            print(f"\n[{idx+1}/{len(df)}] {school_name}")
-            print(f"  URL: {url[:70]}...")
+            print(f"\n[{idx + 1}/{len(df_with_urls)}] {school_name}")
             
-            # Collect content from this page
-            content = self.collect_page_content(school_name, url)
+            try:
+                pages = self.discover_pages(school_name, base_url, max_depth=max_depth, max_pages_per_school=max_pages_per_school, top_pages_limit=top_pages_limit)
+                all_pages.extend(pages)
+                
+            except Exception as e:
+                print(f"    ERROR: {e}")
+                continue
             
-            if content:
-                all_content.append(content)
-                print(f"  Collected content ({content['fetch_method']}) - {content['email_count']} emails found")
-            else:
-                print(f"  ERROR: Failed to collect content")
-            
-            # Save progress every 10 pages
+            # Save progress every 10 schools
             if (idx + 1) % 10 == 0:
-                self._save_content(all_content, output_csv)
-                print(f"\n  Progress saved: {len(all_content)} pages collected so far")
-            
-            time.sleep(0.5)  # Polite delay
+                self._save_progress(all_pages, output_csv)
+                print(f"\n  Progress saved: {len(all_pages)} pages discovered")
         
         # Final save
-        self._save_content(all_content, output_csv)
-        
-        # Print final summary
-        self._print_summary_content(all_content, output_csv, df)
-    
-    def _save_content(self, content_list: List[Dict], filename: str):
-        """Save page content to CSV"""
-        if not content_list:
-            return
-        
-        df = pd.DataFrame(content_list)
-        
-        # Ensure all required columns exist
-        required_cols = ['school_name', 'url', 'html_content', 'fetch_method', 'email_count', 'has_emails']
-        for col in required_cols:
-            if col not in df.columns:
-                df[col] = ''
-        
-        # Reorder columns
-        df = df[required_cols]
-        
-        df.to_csv(filename, index=False)
-    
-    def _print_summary_content(self, content_list: List[Dict], output_file: str, pages_df):
-        """Print final summary"""
-        if not content_list:
-            print("\nERROR: No content collected")
-            return
-        
-        df = pd.DataFrame(content_list)
-        
-        schools_processed = pages_df['school_name'].nunique()
-        schools_with_content = df['school_name'].nunique()
-        total_emails = df['email_count'].sum()
-        pages_with_emails = df[df['has_emails'] == True]
+        self._save_progress(all_pages, output_csv)
         
         print("\n" + "="*70)
-        print("CONTENT COLLECTION COMPLETE")
+        print("PAGE DISCOVERY COMPLETE")
         print("="*70)
-        print(f"Pages processed: {len(pages_df)}")
-        print(f"Pages with content collected: {len(df)}")
-        print(f"Schools processed: {schools_processed}")
-        print(f"Schools with content: {schools_with_content}/{schools_processed} ({schools_with_content/schools_processed*100:.1f}%)")
-        print(f"Pages with emails: {len(pages_with_emails)} ({len(pages_with_emails)/len(df)*100:.1f}%)")
-        print(f"Total emails found: {total_emails}")
+        print(f"Total pages discovered: {len(all_pages)}")
+        print(f"Output file: {output_csv}")
+        print("="*70)
         
-        # Breakdown by fetch method
-        if 'fetch_method' in df.columns:
-            method_counts = df['fetch_method'].value_counts()
-            print(f"\nFetch method breakdown:")
-            for method, count in method_counts.items():
-                print(f"  {method}: {count} pages ({count/len(df)*100:.1f}%)")
+    def _save_progress(self, pages: List[Dict], filename: str):
+        """Save discovered pages to CSV"""
+        if not pages:
+            return
         
-        print(f"\nOutput file: {output_file}")
-        print("="*70)
-        print("📝 Next step: Run Step 4 to parse content with LLM")
-        print("="*70)
+        df = pd.DataFrame(pages)
+        df.to_csv(filename, index=False)
 
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Collect HTML content from pages')
+    parser = argparse.ArgumentParser(description='Discover pages on school websites')
     parser.add_argument('--input', required=True, help='Input CSV from Step 2')
-    parser.add_argument('--output', default='step3_content.csv', help='Output CSV filename')
-    parser.add_argument('--no-selenium', action='store_true', help='Disable Selenium (use requests only)')
+    parser.add_argument('--output', default='step3_pages.csv', help='Output CSV filename')
+    parser.add_argument('--max-depth', type=int, default=3, help='Maximum crawl depth (default: 3)')
+    parser.add_argument('--max-pages-per-school', type=int, default=1000, help='Maximum pages to discover per school (default: 1000 - no practical limit)')
+    parser.add_argument('--top-pages-limit', type=int, default=1000, help='Final filter: keep only top N pages per school by priority (default: 1000 - no practical limit)')
     
     args = parser.parse_args()
     
-    collector = ContentCollector(use_selenium=not args.no_selenium)
-    
-    try:
-        collector.collect_content_from_pages(args.input, args.output)
-    finally:
-        # Cleanup Selenium driver
-        if collector.driver:
-            try:
-                collector.driver.quit()
-            except:
-                pass
+    discoverer = PageDiscoverer()
+    discoverer.process_schools_csv(args.input, args.output, max_depth=args.max_depth, max_pages_per_school=args.max_pages_per_school, top_pages_limit=args.top_pages_limit)

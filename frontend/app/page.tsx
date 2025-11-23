@@ -270,7 +270,7 @@ export default function Home() {
               <button
                 onClick={resetToStart}
                 className="w-full px-6 py-4 bg-gray-700 hover:bg-gray-600 text-white rounded-lg font-medium transition-colors"
-              >
+          >
                 Run Again
               </button>
             </div>
