@@ -140,30 +140,30 @@ class TitleFilter:
 Last Name: {last_name}
 Title: {title}"""
                 
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
                         {"role": "system", "content": TITLE_FILTERING_PROMPT},
                         {"role": "user", "content": user_message}
-                ],
+                    ],
                     temperature=0.0,
                     max_tokens=10  # Just need "KEEP" or "EXCLUDE"
-            )
-            
+                )
+                
                 # Extract response
                 response_text = response.choices[0].message.content.strip().upper()
-            
+                
                 # Parse response
                 if "KEEP" in response_text:
-                return True
+                    return True
                 elif "EXCLUDE" in response_text:
-                return False
-            else:
+                    return False
+                else:
                     # Default to exclude if unclear
                     print(f"      WARNING: Unexpected LLM response for {first_name} {last_name}: {response_text}")
                     return False
                 
-        except Exception as e:
+            except Exception as e:
                 error_str = str(e)
                 is_rate_limit = '429' in error_str or 'rate_limit' in error_str.lower()
                 
